@@ -43,11 +43,16 @@ def Add_Filter(sceneD,pt,angle, thickness = 0.001,name = None,int_ior = 1.5,type
     if name is None:
         name = "Filter"
 
+    #pt = pt+[thickness/2,0,0] #want the front surface of the filter to be at the specified point
+    #trans = mi.ScalarTransform4f().look_at(origin=pt,target=Look_At(pt,angle)[0],up=[0, 0, 1]).scale([thickness/2,1/(2*m2inch),1/(2*m2inch)])
+
+    angle = np.rad2deg(angle)
+    trans = mi.ScalarTransform4f().translate(pt).rotate([0,0,1],angle).translate([thickness/2,0,0]).scale([thickness/2,1/(2*m2inch),1/(2*m2inch)])
     if type=='rough':
 
-
+        
         sceneD[name] = {'type': 'cube',
-                        'to_world': mi.ScalarTransform4f.look_at(origin=pt,target=Look_At(pt,angle)[0],up=[0, 0, 1])@mi.ScalarTransform4f.scale([thickness/2,1/(2*m2inch),1/(2*m2inch)]),
+                        'to_world': trans,
                         'bsdf': {'type': 'roughdielectric',
                                 'int_ior': 1.5,
                                 'distribution': 'beckmann',
@@ -57,9 +62,10 @@ def Add_Filter(sceneD,pt,angle, thickness = 0.001,name = None,int_ior = 1.5,type
 
         }
     elif type =='mirror':
-
+        
+        
         sceneD[name] = {'type': 'cube',
-                        'to_world': mi.ScalarTransform4f.look_at(origin=pt,target=Look_At(pt,angle)[0],up=[0, 0, 1])@mi.ScalarTransform4f.scale([thickness/2,1/(2*m2inch),1/(2*m2inch)]),
+                        'to_world': trans,
                         'bsdf': {'type': 'conductor',
                                 'material': 'none',
                                 },
@@ -69,7 +75,7 @@ def Add_Filter(sceneD,pt,angle, thickness = 0.001,name = None,int_ior = 1.5,type
     elif type =='solid':
 
         sceneD[name] = {'type': 'cube',
-                        'to_world': mi.ScalarTransform4f.look_at(origin=pt,target=Look_At(pt,angle)[0],up=[0, 0, 1])@mi.ScalarTransform4f.scale([thickness/2,1/(2*m2inch),1/(2*m2inch)]),
+                        'to_world': trans,
                         'bsdf': {'type': 'roughconductor',
                                 'material': 'W',
                                 'alpha': 0.8,
@@ -78,10 +84,12 @@ def Add_Filter(sceneD,pt,angle, thickness = 0.001,name = None,int_ior = 1.5,type
 
         }
     else:
+
         sceneD[name] = {'type': 'cube',
-                    'to_world': mi.ScalarTransform4f.look_at(origin=pt,target=Look_At(pt,angle)[0],up=[0, 0, 1])@mi.ScalarTransform4f.scale([thickness/2,1/(2*m2inch),1/(2*m2inch)]),
+                    'to_world': trans,
                     'bsdf': {'type': 'dielectric',
-                            'int_ior': 1.5,
+                            'int_ior': int_ior,
+                            'ext_ior': 1.0,
                             },
                     
 
@@ -89,8 +97,46 @@ def Add_Filter(sceneD,pt,angle, thickness = 0.001,name = None,int_ior = 1.5,type
 
     return 0
 
+def Filter_Chain(sceneD,ptList,angList, thickness = 0.001,nameL = None,int_ior = 1.5,type = 'rough',alternate = False,ptPMT = None,PMT = False):
+    #adds a chain of filters to the scene specified by ptList and angList
+    #Inputs:
+    #sceneD: dictionary, the scene dictionary
+    #ptList: (n,3), the center points of the filters
+    #ptPMT: (n,3), the center points of the PMTs
+    #angList: (n,), the angles of the filters in degrees
+    #thickness: float, the thickness of the filters in meters
+    #nameL: list of strings, the names of the filters in the scene dictionary
+    #int_ior: float, the index of refraction of the filters
+    #type: string, the type of the filters
+    #alternate: bool, if true the filters will be placed in alternating directions (i.e. -45 and 45)
+    numFilt = ptList.shape[0]
+    sign = np.ones_like(angList)
+    if alternate:
+        sign[1::2] = -1 #comment out to make all one direction
 
-def Modify_Filt_Angle(scene,pt,angle,name):
+    if nameL is None:
+        nameL = ['Filter_'+str(x) for x in range(numFilt)]
+
+    if (ptPMT is None) and PMT:
+        ptPMT = np.zeros((numFilt,3))
+        ptPMT[:,0] = ptList[:,0]
+        ptPMT[:,1] = -0.025
+
+    fNameL = []
+    senNameL = []
+    for i in range(ptList.shape[0]):
+        Add_Filter(sceneD,ptList[i,:],np.deg2rad(sign[i]*angList[i]),name = nameL[i], type = type,thickness = thickness,int_ior = int_ior)
+        if PMT:
+            sName = 'PMT_'+nameL[i].split('_')[1]
+            print(sName)
+            print(ptPMT[i])
+            Add_PMT(sceneD,ptPMT[i,0],sign[i]*ptPMT[i,1],name  = sName,irrdMtr =True,xTar = ptList[i,0])
+
+        fNameL.append(nameL[i])
+
+
+    return sceneD,fNameL,senNameL
+def Modify_Filt_Angle(scene,pt,angle,name,verbose = False):
     #modifies the position of a filter, specified by name, in the mitsuba scene change the angle by angle degrees
     #Inputs:
     #scene: mitsuba scene object, the scene object
@@ -103,18 +149,28 @@ def Modify_Filt_Angle(scene,pt,angle,name):
 
     params = mi.traverse(scene)
 
+    shapes = scene.shapes()
+    ids = np.asarray([x.id() for x in shapes])
+    ind = np.argwhere(ids == name)[0][0]
+    bb = shapes[ind].bbox()
+
+    if verbose:
+
+        print('initial center: ', bb.center())
+        print(bb)
+
     vpos = params[name+'.vertex_positions']
     vnorm = params[name+'.vertex_normals']
 
     tL = [vpos,vnorm]
 
-
     #trans = mi.Transform4f.look_at(origin=pt,target=Look_At(pt,angle)[0],up=[0, 0, 1])
     #first move to the origin
-    translate = mi.Transform4f.translate(-pt)
-    rotate = mi.Transform4f.rotate([0,0,1],angle = angle)
+
+    translate = mi.Transform4f().translate(mi.Point3f(-1*pt))
+    rotate = mi.Transform4f().rotate([0,0,1],angle = float(angle))
     #return to the original position
-    transback = mi.Transform4f.translate(pt)
+    transback = mi.Transform4f().translate(mi.Point3f(pt))
     trans = transback@rotate@translate
 
     for i,item in enumerate(tL):
@@ -127,6 +183,16 @@ def Modify_Filt_Angle(scene,pt,angle,name):
     params[name+'.vertex_normals'] = tL[1]
 
     params.update()
+
+    if verbose:
+        shapes = scene.shapes()
+        ids = np.asarray([x.id() for x in shapes])
+        ind = np.argwhere(ids == name)[0][0]
+        bb = shapes[ind].bbox()
+        print('new center: ', bb.center())
+        print(bb)
+        print('\n')
+
     return scene
 
 def Modify_Filt_eta(scene,name, eta):
@@ -154,17 +220,17 @@ def Add_Column_Light(sceneD,radius,angle,radiance=100.0):
     angle = np.deg2rad(angle)
     length = radius/np.tan(angle)
 
-    delta = length/1000.0
-
+    delta = float(length/1000.0)
 
     sceneD['light'] = { 'type': 'disk',
-                            'to_world': mi.ScalarTransform4f.look_at(origin=[-length+delta,0,0],target=[1,0,0],up=[0, 0, 1])@mi.ScalarTransform4f.scale(radius-delta),
+                            'to_world': mi.ScalarTransform4f().look_at(origin=[-length+delta,0,0],target=[1,0,0],up=[0, 0, 1]).scale(radius-delta),
                             'emitter': {'type': 'area',
                                        'radiance':{'type': 'spectrum',
                                                    'value' : radiance,
                                                    },
                                        },
                             }
+    
     #cylinder is placed along the z-axis
     # it is perfectly absorbing on the inside by default
     sceneD['light_cylinder'] = {'type': 'cylinder',
@@ -176,20 +242,39 @@ def Add_Column_Light(sceneD,radius,angle,radiance=100.0):
                                         'reflectance':0.0,
                                         },
                                 }
-    
+    """
     #now add in an end cap to the cylinder
     sceneD['light_endcap'] = {'type': 'disk',
-                            'to_world': mi.ScalarTransform4f.look_at(origin=[-length,0,0],target=[0,0,0],up=[0, 0, 1])@mi.ScalarTransform4f.scale(radius),
+                            'to_world': mi.ScalarTransform4f().look_at(origin=[-length,0,0],target=[0,0,0],up=[0, 0, 1]).scale(radius),
                             'bsdf': {'type': 'diffuse',
                                     'reflectance':0.0,
                                     },
                             }
+    """
     
     return sceneD
 
+def Add_Directional(sceneD,radius, radiance):
+    #adds a directional light source to the scene
+    #Inputs:
+    #sceneD: dictionary, the scene dictionary
+    #rad: float, the radius of the light source
+    #radiance: float, the radiance of the light source
+    #Returns:
+    #sceneD: dictionary, the modified scene dictionary
 
+    sceneD['light'] ={ 'type': 'disk',
+                            'to_world': mi.ScalarTransform4f().look_at(origin=[0,0,0],target=[1,0,0],up=[0, 0, 1]).scale(radius),
+                            'emitter':  { 'type': 'directionalarea',
+                                        'radiance': {'type': 'spectrum',
+                                                'value': radiance,
+                                                },
+                                        },
+                        }
+    
+    return sceneD
 def Base_Scene(rad = 0.002,angle = 4, radiance = 1000):
-
+    
     base_scene = {'type': 'scene',
                   'integrator': {'type': 'volpath',
                                  'max_depth':-1,
@@ -199,10 +284,20 @@ def Base_Scene(rad = 0.002,angle = 4, radiance = 1000):
     }
 
     base_scene = Add_Column_Light(base_scene,rad,angle,radiance)
+    """
 
+    base_scene = {'type': 'scene',
+                  'integrator': {'type': 'ptracer',
+                                 'max_depth':-1,
+                                 'hide_emitters': False,
+                                 },
+                
+    }
+    base_scene = Add_Directional(base_scene,rad,radiance)
+    """
     return base_scene 
 
-def Add_PMT(sceneD,xCent,yCent,name = None,width = 500,irrdMtr = False):
+def Add_PMT(sceneD,xCent,yCent,z=0,name = None,width = 500,irrdMtr = False,xTar = None):
 
     #adds a CAD model representaiton of a PMT, just a rectangular box wit a hole in one face
     #as well as a camera sensor inside the box facing the hole
@@ -213,11 +308,15 @@ def Add_PMT(sceneD,xCent,yCent,name = None,width = 500,irrdMtr = False):
     #yCent: float, the y center of the hole of the PMT in meters
     #name: string, the name of the PMT object in the scene dictionary
     #width: int, the width of the camera sensor in pixels
+    #xTar: float, the x target of the camera sensor in meters
     #Returns:
     #sceneD: dictionary, the modified scene dictionary
 
     if name is None:
         name = 'PMT'
+
+    if xTar is None:
+        xTar = xCent
 
     PMTfaceDim = 0.022 #m
     PMTlongDim = 0.05 #m
@@ -229,24 +328,31 @@ def Add_PMT(sceneD,xCent,yCent,name = None,width = 500,irrdMtr = False):
     cx = xCent
     cy = yCent
     
-
+    
     sceneD[name] = {'type': 'obj',
                      'filename' : 'PMTmitsuba.obj',
-                     'to_world': mi.ScalarTransform4f.look_at(origin=[cx,cy,0],target=[cx,0,0],up=[0, 0, 1])@mi.ScalarTransform4f.scale(0.001), #convert from mm to m
+                     'to_world': mi.ScalarTransform4f().look_at(origin=[cx,cy,z],target=[xTar,0,0],up=[0, 0, 1]).scale(0.001), #convert from mm to m
                      'face_normals': True,
-                     'bsdf': {'type': 'roughconductor',
-                                'material': 'W',
-                                'alpha': 0.8,
-                                },
+                     'bsdf': {'type': 'diffuse',
+                                    'reflectance':0.0,
+                                    },
     }
     
     
+    """
+                         'bsdf': {'type': 'roughconductor',
+                                'material': 'W',
+                                'alpha': 0.8,
+                                },
+    """
+    
 
-    camy = yCent+yDir*PMTfaceDim/2.0
+    #camy = yCent+yDir*PMTfaceDim/2.0
+    camy = yCent
 
     if irrdMtr:
         sceneD[name+'_sensor'] = {'type': 'disk',
-                                  'to_world': mi.ScalarTransform4f.look_at(origin=[cx,camy+yDir*0.0005,0],target=[cx,0,0],up=[0, 0, 1])@mi.ScalarTransform4f.scale(0.0045),
+                                  'to_world': mi.ScalarTransform4f().look_at(origin=[cx,camy+yDir*0.0005,z],target=[xTar,0,0],up=[0, 0, 1]).scale(0.0045),
 
                                   'sensor': {'type': 'irradiancemeter',
                                         'film':{
@@ -264,7 +370,7 @@ def Add_PMT(sceneD,xCent,yCent,name = None,width = 500,irrdMtr = False):
         #no offset in z for camera since it is defined by its center point
         sceneD[name+'_sensor'] = {'type': 'perspective',
                                 'fov': 90,
-                                'to_world': mi.ScalarTransform4f.look_at(origin=[cx,camy,0],target=[cx,0,0],up=[0, 0, 1]), 
+                                'to_world': mi.ScalarTransform4f().look_at(origin=[cx,camy,z],target=[xTar,0,0],up=[0, 0, 1]), 
                                 'sensor': {
                                     'type': 'hdrfilm',
                                     'width':width, #low res for fast writing to numpy array
@@ -278,7 +384,7 @@ def Add_PMT(sceneD,xCent,yCent,name = None,width = 500,irrdMtr = False):
 
 def AddSensor(sceneD, name, loc, tar):
     sceneD[name] = {'type': 'disk',
-                'to_world': mi.ScalarTransform4f.look_at(origin=loc,target=tar,up=[0, 0, 1])@mi.ScalarTransform4f.scale(0.004), #4mm radius sensor
+                'to_world': mi.ScalarTransform4f().look_at(origin=loc,target=tar,up=[0, 0, 1])@mi.ScalarTransform4f().scale(0.004), #4mm radius sensor
                 'sensor': {
                     'type': 'irradiancemeter',
                         'film':{
@@ -293,7 +399,7 @@ def AddSensor(sceneD, name, loc, tar):
     
     return sceneD
 
-def Align_Pert(scene, filterNL, filterPts, sensorI, SD,num=50,plot = True):
+def Align_Pert(scene, filterNL, filterPts, sensorI, SD,num=50,plot = True,spp = 10000):
     #perturbs the filters specified by filterNL and filterPts in the scene dictionary by a random angle
     #choosen from a normal distribution with a standard deviation of SD
     #renders the scene with the perturbed filters and returns the irradiance at the sensor specified by sensorI
@@ -316,15 +422,18 @@ def Align_Pert(scene, filterNL, filterPts, sensorI, SD,num=50,plot = True):
 
     out = np.zeros(num)
 
-    baseline = np.asarray(mi.render(scene,spp = 100000,sensor = sensorI))[0]
+
+    surf = scene.sensors()[sensorI].get_shape().surface_area()
+
+    baseline = np.mean([np.asarray(mi.render(scene,spp = spp,sensor = sensorI))[0]*surf for x in range(10)])
 
 
     for i in range(num):
         for j,cFilter in enumerate(filterNL):
             scene = Modify_Filt_Angle(scene,filterPts[j],angles[j,i],cFilter)
 
-        image = mi.render(scene,spp = 100000,sensor = sensorI)
-        out[i]= np.asarray(image)[0]
+        image = mi.render(scene,spp = spp,sensor = sensorI)
+        out[i]= np.asarray(image)[0]*surf
         print(out[i])
 
         #now reset the angles
@@ -332,6 +441,7 @@ def Align_Pert(scene, filterNL, filterPts, sensorI, SD,num=50,plot = True):
             scene = Modify_Filt_Angle(scene,filterPts[j],-1*angles[j,i],cFilter)
 
     if plot:
+        embed()
         f,a = plt.subplots(1,1)
         aveDev = np.mean(angles,axis = 0)
         nbins = 10
@@ -351,7 +461,7 @@ def Align_Pert(scene, filterNL, filterPts, sensorI, SD,num=50,plot = True):
 
         plt.show()
 
-    return 0 
+    return angles,baseline,out
 
 
 
@@ -369,9 +479,15 @@ def Baseline_Report(sceneD, filterNL,senNameL,plot = False):
         #assumes that the filters are ordered by closeness to the light source
 
         scene = mi.load_dict(sceneCopy)
-        image = mi.render(scene,spp = 1000000,sensor = i) #hopefully sensors are indexed by order added to scene
-        #scene.sensors()[i].shape().surface_area()
-        out[i] = np.asarray(image)[0]
+
+        shapes = scene.sensors()
+
+        ids = np.asarray([x.get_shape().id() for x in shapes])
+        ind = np.argwhere(ids == (senNameL[i]+'_sensor'))[0][0]
+
+        image = mi.render(scene,spp = 100000000,sensor = int(ind)) 
+        surf = scene.sensors()[i].get_shape().surface_area()
+        out[i] = np.asarray(image)[0]*surf
 
         sceneCopy.pop(cFilter)
         #sceneCopy.pop(senNameL[i])
@@ -393,7 +509,8 @@ def Baseline_Report(sceneD, filterNL,senNameL,plot = False):
 
     return 0 
 
-def Render_Check(sceneD,target, pupil=[0,0,0],width=500,fov=27,illuminate = True,spp = 100):
+
+def Render_Check(sceneD,target, pupil=[0,0,0],width=500,fov=27,illuminate = True,spp = 10000):
     """
     Renders the scene and displays the image by creating a camera and a diffuse light source.
     Does not modify the scene dictionary. Must call plt.show() to display the image after calling this funciton
@@ -428,7 +545,7 @@ def Render_Check(sceneD,target, pupil=[0,0,0],width=500,fov=27,illuminate = True
     tDict['camera'] = {
             'type': 'perspective',
             'fov': fov,
-            'to_world': mi.ScalarTransform4f.look_at(origin=pupil,target=target,up=[0, 0, 1]),
+            'to_world': mi.ScalarTransform4f().look_at(origin=pupil,target=target,up=[0, 0, 1]),
             'film1': {
                 'type': 'hdrfilm',
                 'width':width, #low res for fast writing to numpy array
@@ -456,7 +573,6 @@ def Render_Check(sceneD,target, pupil=[0,0,0],width=500,fov=27,illuminate = True
     print('Scene Loaded in %f seconds'%(time()-t))
 
     image = mi.render(scene,spp = spp)
-    print(image)
 
     f,a = plt.subplots(1,1)
     a.imshow(mi.util.convert_to_bitmap(image))
