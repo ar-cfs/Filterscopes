@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from IPython import embed
 from time import time
+import drjit as dr
 colormap = [[6, 1, 31],[12, 0, 40],[14, 0, 51], [16, 1, 60],
  [17, 1, 76], [23, 0, 90], [26, 1, 105], [28, 0, 119], [28, 0, 136], 
 [34, 0, 151],[36, 1, 165], [37, 0, 176], [37, 1, 187], [36, 0, 194],
@@ -54,6 +55,90 @@ def wave_to_rgb(wavlgth):
     col = colormap[colorindex]
     return np.asarray(col)/255
 
+def Process_Zeeman(center, width, wvlD = 0.1,plot = False):
+    """
+    Calculates how much lines overlap due to Zeeman splitting
+    returns a wavelength grid an associated overlap array which
+    which indicates how much the lines overlap
+    where 0 is no overlap and -n is the amount of overlap
+    i.e. if n lines perfectly overlap, -n is returned
+    a flat top function is used to indicate the overlap
+    Inputs:
+    - center: nparray - the center wavelengths of the lines
+    - width: nparray - the width of zeeman splitting of the lines in nm
+    - wvlD: float - the spacing for the wavelength grid in nm, default is 0.1 nm
+    Outputs:
+    - wvl: nparray - the wavelength grid for the lines
+    """
+    wvl = np.arange(center.min() - width.max(), center.max() + width.max(), wvlD)
+    overlap = np.zeros_like(wvl)
+
+    for i in range(len(center)):
+        #find the indices of the wavelengths which are within the width of the line
+        mask = np.abs(wvl - center[i]) <= width[i] / 2.
+        #set the overlap to -1 for the indices which are within the width
+        overlap[mask] -= 1
+    
+    if plot:
+        f,a = plt.subplots(1,1)
+        a.plot(wvl, overlap, color='black', linewidth=2)
+
+        #add vertical lines colored by the wavelength
+        for i in range(len(center)):
+            a.axvline(center[i], color=wave_to_rgb(center[i]), linewidth=2,alpha = 0.1,ls = '--')
+        a.set_xlabel('Wavelength (nm)')
+        a.set_ylabel('Overlap (-n)')
+        a.set_title('Zeeman Overlap')
+        plt.show()
+    return wvl, overlap
+
+def Prep_Zeeman(filename, wvlD = 0.1, plot = False):
+    wvl, spec, species, ion, prevTok,width = Load_xlsx(filename)
+    wvlOvlp,ovrlp = Process_Zeeman(wvl, width,wvlD = wvlD,plot = plot)
+    return wvlOvlp,ovrlp
+
+def Load_xlsx(filename):
+    data = pd.read_excel(filename, sheet_name='Sheet1',header = 0,usecols = [1,2,3,12,13,14,16])
+    wvl = np.array(data['wave']).astype(float)
+    spec = np.array(data['element']).astype(str)
+    ion = np.array(data['charge']).astype(str)
+    species = spec + ' ' + ion
+    pec = np.array(data['PEC_ind']).astype(int)
+    uInd = np.array(data['up_ind']).astype(int)
+    lInd = np.array(data['low_ind']).astype(int)
+
+    
+
+    #stack pec,uInd, lInd to a n,3 array
+    adas = np.stack((pec, uInd, lInd), axis=1)
+    """
+    #find the rows where all entries are -1
+    mask = np.all(adas == -1, axis=1)
+
+    #remove those rows from wvl, species, and prevTok
+    wvl = wvl[~mask]
+    species = species[~mask]
+    adas = adas[~mask]
+    spec = spec[~mask]
+    ion = ion[~mask]
+    """
+    
+    width = np.array(data['Zee_width (nm)']).astype(float)
+
+    ###
+    #place filler while Curt is working on getting zeeman widths
+    mask = np.isnan(width)
+    tempW = np.unique(width[~mask])
+
+    #randomly assign widths from the non-nan values to the nan values
+    width[mask] = np.random.choice(tempW, size=np.sum(mask), replace=True)
+    ###
+
+    prevTok = np.full_like(species, False, dtype=bool)
+
+    return wvl, spec, species, ion, prevTok,width
+
+
 def Load_data(filename):
     """
     Load data from an xlsx file
@@ -67,7 +152,8 @@ def Load_data(filename):
     - prevTok: nparray- boolean array indicating if the line was used in a tokamak
     """
 
-    
+    """
+    #For previous google sheet 
     data = pd.read_excel(filename, sheet_name='Sheet1',header = 0,usecols = [0,1,5])
     #convert it to numpy arrays
     wvl = np.array(data['lambda']).astype(float)
@@ -81,11 +167,16 @@ def Load_data(filename):
     species = species[mask]
     prevTok = prevTok[mask]
 
-
-
     #parse species to ge the symbol and ionization state
     spec = np.array([s.split(' ')[0] for s in species])
     ion = np.array([s.split(' ')[1] for s in species])
+    print('unique lines:', wvl.shape[0])
+    """
+
+    wvl, spec, species, ion, prevTok,_ = Load_xlsx(filename)
+
+
+
     print('unique lines:', wvl.shape[0])
 
     #this is super sloppy
@@ -93,6 +184,7 @@ def Load_data(filename):
     specOut = []
     ionOut = []
     prevTokOut = []
+
 
 
 
@@ -108,6 +200,7 @@ def Load_data(filename):
 
         cion = ion[maskTop][sInd]
         cprevTok = prevTok[maskTop][sInd]
+
         
 
         gI = np.full_like(cwvl,False)
@@ -133,11 +226,14 @@ def Load_data(filename):
 
 
 
+
     print('unique lines after downselect:', len(wvlOut))
     wvl = np.asarray(wvlOut).flatten()
     spec = np.asarray(specOut).flatten()
     ion = np.asarray(ionOut).flatten()
     prevTok = np.asarray(prevTokOut).flatten()
+
+
 
     #convert prevtok to a boolean array
     prevOut = np.full(len(prevTok), False, dtype=bool)
@@ -182,8 +278,6 @@ def Filter_Stacks(stackL,wvl,spec,ion,prevTok):
     - outPT: nparray- boolean array indicating if the line was used in a tokamak for each possible stack, shape (unique species, tot wavelength combinations)
     """
 
-
-
     uspec = []
     for i in range(len(stackL)):
         for j in range(len(stackL[i])):
@@ -197,6 +291,7 @@ def Filter_Stacks(stackL,wvl,spec,ion,prevTok):
         num[i] = np.sum(s==spec)
     
     #multiply the number of lines for each species
+
     tot = np.prod(num)
 
     outWvl = np.zeros((uspec.shape[0],tot),dtype = np.float16)
@@ -236,6 +331,43 @@ def Filter_Stacks(stackL,wvl,spec,ion,prevTok):
     print(f'Combinations generated in {time()-t:.2f} seconds')
 
     return outWvl, outAS, outPT
+
+def Grade_Zeeman(wvl, overWvl, Overlap, plot=False):
+    """
+    Memory-efficient version of Grade_Zeeman.
+    """
+    import drjit as dr
+
+    idx = dr.full(dr.cuda.TensorXf,0,wvl.shape)
+    smllD = dr.full(dr.cuda.TensorXf, dr.inf,wvl.shape)  # Use dr.full for GPU compatibility
+
+
+    wvlT = dr.cuda.TensorXf(wvl) #GPU array
+    print('done allocating GPU memory')
+    
+
+    # Iterate over each wavelength in overWvl
+    for i, ow in enumerate(overWvl):
+        # Compute the absolute difference for the current overWvl value
+
+
+        diff = dr.abs(wvlT - ow)
+
+        # Find where the current difference is smaller than the previous minimum
+        mask = diff < smllD
+        smllD[mask] = diff[mask]
+
+        # Update the output indices where the current difference is smaller
+        idx[mask] = i
+
+
+    #convert back to numpy array
+    print('copying data back to CPU')
+    idxArr = np.array(idx,dtype=int)
+    out = np.take(Overlap, idxArr).sum(0)+ wvl.shape[0]  #add wvl.shape[0] to make 0 no overlap and -n overlap of n lines
+    print('done copying data back to CPU')
+
+    return out
 
 def Grade_Wvl(wvl,clip = 30):
     """
@@ -302,7 +434,7 @@ def Grade_UV(wvl,cutoff = 450,lwvl = 350):
     #np.sum(wvl > cutoff,axis = 0)/wvl.shape[0] 
     return out  
 
-def Grade_Stack(stackL, wvl, atomicS, prevTok):
+def Grade_Stack(stackL, wvl, atomicS, prevTok,filename,lowMem = True):
     """
     Grade the stack based on the wavelength, atomic state and previous tokamak usage
     Returns a score for each line in the stack
@@ -323,8 +455,13 @@ def Grade_Stack(stackL, wvl, atomicS, prevTok):
     #2) previous tokamak usage
     #3) number of lines below a certain wavelength
 
+    
+    #setup the overlap and wavelength arrays
+    wvlOvr,ovrlp = Prep_Zeeman(filename, wvlD = 0.25, plot = True)
+
     #spec = np.array([s.split(' ')[0] for s in atomicS])
-    out1 = np.zeros((wvl.shape[-1],3),dtype = np.float16)
+
+    out1 = np.zeros((wvl.shape[-1],4),dtype = np.float16)
 
 
     #all the same for each row, so we can just use the first row
@@ -332,6 +469,11 @@ def Grade_Stack(stackL, wvl, atomicS, prevTok):
 
     #find the indexes of the speces in the stackL
     idx = [np.searchsorted(cspec, substack) for substack in stackL]
+
+    
+    bestScore = -np.inf
+    bestStack = []
+    bestScores = (0,0,0,0)
 
     for i in range(len(idx)):
         cwvl = np.take(wvl,idx[i],axis =0)
@@ -341,15 +483,33 @@ def Grade_Stack(stackL, wvl, atomicS, prevTok):
         t = time()
         print(f'Grading stack {i+1}/{len(idx)}...')
 
-        wvlScore = Grade_Wvl(cwvl)
-        ptScore = Grade_PrevTok(cpt)
-        uvScore = Grade_UV(cwvl)
+
+        out1[:,0] += Grade_Wvl(cwvl)
+        print('wvl done')
+        out1[:,1] += Grade_PrevTok(cpt)
+        print('Prev Tok done')
+        out1[:,2] += Grade_UV(cwvl)
+        print('UV done')
+        out1[:,3] += Grade_Zeeman(cwvl,wvlOvr,ovrlp)
+        print('Zeeman done')
 
         print(f'Stack {i+1} graded in {time()-t:.2f} seconds')
 
-        out1[:,0] += wvlScore
-        out1[:,1] += ptScore
-        out1[:,2] += uvScore
+        #cScore = (wvlScore + ptScore + uvScore + zScore)  #negative score for minimization
+        """
+        if cScore > bestScore:
+            bestScore = cScore
+            bestStack = stackL[i]
+            bestScores = (wvlScore, ptScore, uvScore, zScore)
+            print(f'New best stack: {bestStack} with scores Wvl: {wvlScore:.2f}, PT: {ptScore:.2f}, UV: {uvScore:.2f}, Z: {zScore:.2f}, Total: {-bestScore:.2f}')
+        
+        print(f'Stack {i+1} graded in {time()-t:.2f} seconds')
+        if not lowMem:
+            out1[:,0] += wvlScore
+            out1[:,1] += ptScore
+            out1[:,2] += uvScore
+            out1[:,3] += zScore
+        """
     """
     t = time()
 
@@ -381,9 +541,11 @@ def Grade_Stack(stackL, wvl, atomicS, prevTok):
             print(f'Processed {totInd} stacks in {time()-t:.2f} seconds')
     print(f'Graded {totInd} stacks in {time()-t:.2f} seconds')
     """
+    #plot the best stacks
+
     return out1
 
-def Plot_Stack(scores,stackL,wvl,atomicS,prevTok,wvlW = 1, uvSW = 1, prevTokW = 1):
+def Plot_Stack(scores,stackL,wvl,atomicS,prevTok,wvlW = 1, uvSW = 1, prevTokW = 1,zW = 1,zFilename = 'sparc_line_ids_widths_v0.xlsx'):
     """
     Plot the scores for each stack
     Inputs:
@@ -393,10 +555,11 @@ def Plot_Stack(scores,stackL,wvl,atomicS,prevTok,wvlW = 1, uvSW = 1, prevTokW = 
     - atomicS: nparray- the atomic states for each stack
     - prevTok: nparray- the previous tokamak usage for each stack
     """
-
+    wvlOvl,ovrlp = Prep_Zeeman(zFilename, wvlD = 0.5, plot = True)
     scores[:,0] *= wvlW
     scores[:,1] *= prevTokW
     scores[:,2] *= uvSW
+    scores[:,3] *= zW
     weightS = np.sum(scores, axis=1)
 
     #sort the list and order from highest to lowest
@@ -421,15 +584,16 @@ def Plot_Stack(scores,stackL,wvl,atomicS,prevTok,wvlW = 1, uvSW = 1, prevTokW = 
 
 
             Plot_Lines(cwvl,cas,None,a[j])
+            a[j].plot(wvlOvl, ovrlp, color='black', linewidth=2)
 
         #set the title with the total score and weighting
         total_score = weightS[i]
         wvl_score = scores[i,0]
         prevTok_score = scores[i,1]
         uv_score = scores[i,2]
-        
+        z_score = scores[i,3]
 
-        a[0].set_title(f' Total Score: {total_score:.2f}, Wvl Score: {wvl_score:.2f}, UV Score: {uv_score:.2f}, Prev Tok Score: {prevTok_score:.2f}')
+        a[0].set_title(f' Total Score: {total_score:.2f}, Wvl Score: {wvl_score:.2f}, UV Score: {uv_score:.2f}, Prev Tok Score: {prevTok_score:.2f}, Z Score: {z_score:.2f}')
 
         #remove the y labels
         for ax in a:
@@ -480,7 +644,7 @@ def Plot_Lines(wvl, spec, ion,ax = None):
     if ion is None:
         ion = np.array(['']*spec.shape[0])
 
-    height = 1
+    height = -3
 
     for i in range(wvl.shape[0]):
         cclr = wave_to_rgb(wvl[i])
@@ -491,6 +655,8 @@ def Plot_Lines(wvl, spec, ion,ax = None):
 
 if __name__ == '__main__':
     filename = 'lines.xlsx'
+    filename = 'sparc_line_ids_v1.xlsx'
+    filename = 'sparc_line_ids_widths_v0.xlsx'
     saveF = 'TestStack.npz'
     
     stackL =[ ['B','He','O'],['N','C','B','W']]
@@ -502,18 +668,22 @@ if __name__ == '__main__':
     stackL = [['O', 'N', 'C', 'B', 'He'],\
               ['W', 'Mo', 'Fe', 'Ni', 'Cu', 'Al','C'],\
               ['He', 'Ni', 'Mo', 'Al', 'C', 'N' ],]
+    
+    stackL = [['O', 'N', 'C', 'B', 'He'],\
+            ['W', 'Mo', 'Fe', 'Ni', 'Cu', 'Al'],\
+            ['He', 'Ni', 'Mo', 'Al', 'C', 'N' ],]
     #wvl, spec, ion, prevTok= Load_data(filename)
     #outWvl, outAS, outPT = Filter_Stacks(stackL,wvl, spec, ion, prevTok)
     #Save_Stack('TestStack', outWvl,outAS,outPT)
 
-    outWvl,outAS,outPT = Load_Stack(saveF)
+    #outWvl,outAS,outPT = Load_Stack(saveF)
 
-    scores = Grade_Stack(stackL, outWvl, outAS, outPT)
+    #scores = Grade_Stack(stackL, outWvl, outAS, outPT,filename)
     #Save_GradedStack(saveF, outWvl,outAS,outPT,scores)
 
     outWvl, outAS, outPT, scores = Load_GradedStack(saveF)
 
-    Plot_Stack(scores, stackL, outWvl, outAS, outPT,prevTokW = 0.5,uvSW = 2)
+    Plot_Stack(scores, stackL, outWvl, outAS, outPT,prevTokW = 0.5,uvSW = 2,zW = 1,zFilename = filename)
 
     #Plot_lines(wvl, spec, ion)
-    
+
