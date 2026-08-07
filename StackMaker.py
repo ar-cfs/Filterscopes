@@ -1,9 +1,15 @@
+import csv
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
 from IPython import embed
 from time import time
 import drjit as dr
+import h5py
+import os
+from scipy.signal import find_peaks
+
+
 colormap = [[6, 1, 31],[12, 0, 40],[14, 0, 51], [16, 1, 60],
  [17, 1, 76], [23, 0, 90], [26, 1, 105], [28, 0, 119], [28, 0, 136], 
 [34, 0, 151],[36, 1, 165], [37, 0, 176], [37, 1, 187], [36, 0, 194],
@@ -55,7 +61,156 @@ def wave_to_rgb(wavlgth):
     col = colormap[colorindex]
     return np.asarray(col)/255
 
-def Process_Zeeman(center, width, wvlD = 0.1,plot = False):
+def LowHighCent(wvl,intens ):
+    """
+    Find the low, high, and center wavelengths of a line given its intensity profile.
+    Currently finds the lowest and highest non-zero intensity points as the low and high.
+    Assumes wvl and intens are sorted in ascending order of wavelength.
+    Inputs:
+    - wvl: nparray - the wavelength array
+    - intens: nparray - the intensity array
+    Outputs:
+    - low: float - the low wavelength of the line
+    - high: float - the high wavelength of the line
+    - center: float - the center wavelength of the line
+    """
+    #cind = find_peaks(intens,prominence = max(intens)/20,distance = 500)
+    cind = find_peaks(intens,prominence = max(intens)/30,distance = 500)
+    centers = wvl[cind[0]]
+    low = np.zeros_like(centers)
+    high = np.zeros_like(centers)
+
+
+    maxW = wvl[-1]-wvl[0]
+    minW = np.diff(centers)/2
+
+    if len(minW)==0:
+        minW = maxW
+    else:
+        minW = minW.min()
+
+
+    for i, center in enumerate(centers):
+        peak_intensity = intens[cind[0][i]]
+        threshhold = peak_intensity * 0.01  # 1% of peak value
+
+        #find low and high wavelengths by finding first threshold intensity points
+        #within minW of center
+
+        mask = np.logical_and(wvl>center-minW, wvl<center+minW)
+
+        subW = wvl[mask & (intens > threshhold)]
+        low[i] = subW[0]
+        high[i] = subW[-1]
+
+    print('Number of peaks found:', len(centers))
+    return low, high, centers
+
+def Load_H5_Zeeman(folder='broad',wvlD = 0.01,plot = False):
+    """Process h5 files containing zeeman split lines to create a excel file
+    which contains the low, high, and center wavelengths of each line. Must be run once
+    before using Prep_Zeeman.
+    Inputs:
+    - folder: str - the folder containing the h5 files
+    - wvlD: float - the spacing for the wavelength grid in nm, default is 0.1 nm
+    Outputs:
+    - wvl: nparray - the wavelength grid for the lines
+    - ovrlp: nparray - normalized summed spectra of all the lines in folder
+    """
+
+    wvl = np.arange(300,900, wvlD)
+    out = np.zeros_like(wvl)
+
+    
+
+    files = [f for f in os.listdir(folder) if f.endswith('.h5')]
+
+
+    fOut = []
+    centers = []
+    lows = []
+    highs = []
+
+
+    for j,file in enumerate(files):
+        print(file)
+        f = h5py.File(os.path.join(folder, file), 'r')
+
+        sig = f['signal'][:]
+        cwvl = f['wave_air'][:]
+
+
+        #sort by wavelength
+        sInd = np.argsort(cwvl)
+        cwvl = cwvl[sInd]
+        sig = sig[sInd]
+
+
+
+        if np.any(np.isnan(sig)):
+            print('NaN values found in file:', file)
+            continue
+
+        #all-zero signal (e.g. unsupported 1P-1S term pairs) would give 0/0 = NaN
+        #in the rescale below and poison the summed overlap array
+        if sig.max() == sig.min():
+            print('Flat/all-zero signal found in file, skipping:', file)
+            continue
+
+
+
+        #find the lowest and highest non-zero intensity points
+        low, high, center = LowHighCent(cwvl, sig)
+
+        for i in range(len(low)):
+            fOut.append(file.split('.h5')[0])
+            centers.append(center[i])
+            lows.append(low[i])
+            highs.append(high[i])
+
+        
+        if plot:
+            fig,a = plt.subplots(1,1)
+            a.set_title(file)
+            a.plot(cwvl,sig)
+
+            for i in range(len(low)):
+                a.axvline(low[i],color='red',ls='--')
+                a.axvline(high[i],color='red',ls='--')
+                a.axvline(center[i],color='blue',ls='--')
+            a.set_xlabel('Wavelength (nm)')
+            a.set_ylabel('Intensity (a.u.)')
+            plt.show()
+
+
+
+
+        #rescale to between 0 and 1
+        sig = (sig - sig.min())/(sig.max()-sig.min())
+
+
+        #interpolate sig onto wvl and add to out
+        out += np.interp(wvl, cwvl, sig, left=0.0, right=0.0)
+
+    #save the center, low and high wavelengths in a csv file
+    with open(os.path.join(folder, 'wavelengths.csv'), 'w', newline='') as csvfile:
+        fieldnames = ['file', 'low', 'high', 'center']
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for i in range(len(lows)):
+            writer.writerow({'file': fOut[i], 'low': lows[i], 'high': highs[i], 'center': centers[i]})
+
+    if plot:
+        f,a = plt.subplots(1,1)
+        a.plot(wvl, out, color='black', linewidth=2)
+
+        a.set_xlabel('Wavelength (nm)')
+        a.set_ylabel('Overlap (-n)')
+        a.set_title('Zeeman Overlap')
+        plt.show()
+    return wvl, out
+
+def Process_Zeeman(center, low,high, wvlD = 0.1,plot = False):
     """
     Calculates how much lines overlap due to Zeeman splitting
     returns a wavelength grid an associated overlap array which
@@ -65,17 +220,23 @@ def Process_Zeeman(center, width, wvlD = 0.1,plot = False):
     a flat top function is used to indicate the overlap
     Inputs:
     - center: nparray - the center wavelengths of the lines
-    - width: nparray - the width of zeeman splitting of the lines in nm
+    - low: nparray - lower wavelength "width" of the line in center
+    - high: nparray - higher wavelength "width" of the line in center
     - wvlD: float - the spacing for the wavelength grid in nm, default is 0.1 nm
     Outputs:
     - wvl: nparray - the wavelength grid for the lines
     """
-    wvl = np.arange(center.min() - width.max(), center.max() + width.max(), wvlD)
+    pad = np.max(high-low)/2
+
+    wvl = np.arange(center.min() - pad, center.max() + pad, wvlD)
     overlap = np.zeros_like(wvl)
+
+    
 
     for i in range(len(center)):
         #find the indices of the wavelengths which are within the width of the line
-        mask = np.abs(wvl - center[i]) <= width[i] / 2.
+        mask = np.logical_and(wvl>=low[i], wvl<=high[i])
+
         #set the overlap to -1 for the indices which are within the width
         overlap[mask] -= 1
     
@@ -93,8 +254,11 @@ def Process_Zeeman(center, width, wvlD = 0.1,plot = False):
     return wvl, overlap
 
 def Prep_Zeeman(filename, wvlD = 0.1, plot = False):
-    wvl, spec, species, ion, prevTok,width = Load_xlsx(filename)
-    wvlOvlp,ovrlp = Process_Zeeman(wvl, width,wvlD = wvlD,plot = plot)
+    #load csv file
+    
+    zeemanD = pd.read_csv(filename)
+    wvlOvlp,ovrlp = Process_Zeeman(zeemanD['center'], zeemanD['low'], zeemanD['high'], wvlD = wvlD,plot = plot)
+
     return wvlOvlp,ovrlp
 
 def Load_xlsx(filename):
@@ -332,40 +496,50 @@ def Filter_Stacks(stackL,wvl,spec,ion,prevTok):
 
     return outWvl, outAS, outPT
 
-def Grade_Zeeman(wvl, overWvl, Overlap, plot=False):
+def Grade_Zeeman(wvl, overWvl, Overlap, plot=False, chunkN = 20_000_000):
     """
     Memory-efficient version of Grade_Zeeman.
+    Processes the combination axis in chunks of chunkN so no single
+    host-pinned/GPU allocation exceeds a few hundred MB (a 6-species x 98M
+    combination stack needs a 4 GB pinned transfer in one shot, which the
+    driver refuses).
     """
     import drjit as dr
 
-    idx = dr.full(dr.cuda.TensorXf,0,wvl.shape)
-    smllD = dr.full(dr.cuda.TensorXf, dr.inf,wvl.shape)  # Use dr.full for GPU compatibility
+    ncomb = wvl.shape[-1]
+    out = np.empty(ncomb, dtype=np.float32)
 
+    for s in range(0, ncomb, chunkN):
+        e = min(s + chunkN, ncomb)
+        cwvl = np.ascontiguousarray(wvl[:, s:e], dtype=np.float32)
 
-    wvlT = dr.cuda.TensorXf(wvl) #GPU array
-    print('done allocating GPU memory')
-    
+        idx = dr.full(dr.cuda.TensorXf,0,cwvl.shape)
+        smllD = dr.full(dr.cuda.TensorXf, dr.inf,cwvl.shape)  # Use dr.full for GPU compatibility
 
-    # Iterate over each wavelength in overWvl
-    for i, ow in enumerate(overWvl):
-        # Compute the absolute difference for the current overWvl value
+        wvlT = dr.cuda.TensorXf(cwvl) #GPU array
 
+        # Iterate over each wavelength in overWvl
+        #this list is much smaller than the total combinations of stack wavelengths
+        #even though it can still be pretty large
+        for i, ow in enumerate(overWvl):
 
-        diff = dr.abs(wvlT - ow)
+            diff = dr.abs(wvlT - ow)#find the closest overlap wavelength to wvl of lines
 
-        # Find where the current difference is smaller than the previous minimum
-        mask = diff < smllD
-        smllD[mask] = diff[mask]
+            # Find where the current difference is smaller than the previous minimum
+            mask = diff < smllD
+            smllD[mask] = diff[mask]
 
-        # Update the output indices where the current difference is smaller
-        idx[mask] = i
+            # Update the output indices where the current difference is smaller
+            idx[mask] = i
 
+        #convert back to numpy array
+        idxArr = np.array(idx,dtype=int)
+        #sums the overlap values for each possible stack
+        out[s:e] = np.take(Overlap, idxArr).sum(0)+ wvl.shape[0]  #add wvl.shape[0] to make 0 no overlap and -n overlap of n lines
 
-    #convert back to numpy array
-    print('copying data back to CPU')
-    idxArr = np.array(idx,dtype=int)
-    out = np.take(Overlap, idxArr).sum(0)+ wvl.shape[0]  #add wvl.shape[0] to make 0 no overlap and -n overlap of n lines
-    print('done copying data back to CPU')
+        del idx, smllD, wvlT, diff, mask
+        dr.flush_malloc_cache()  #release cached GPU/pinned memory before the next chunk
+        print(f'chunk {e}/{ncomb} done')
 
     return out
 
@@ -484,11 +658,11 @@ def Grade_Stack(stackL, wvl, atomicS, prevTok,filename,lowMem = True):
         print(f'Grading stack {i+1}/{len(idx)}...')
 
 
-        out1[:,0] += Grade_Wvl(cwvl)
+        #out1[:,0] += Grade_Wvl(cwvl)
         print('wvl done')
-        out1[:,1] += Grade_PrevTok(cpt)
+        #out1[:,1] += Grade_PrevTok(cpt)
         print('Prev Tok done')
-        out1[:,2] += Grade_UV(cwvl)
+        #out1[:,2] += Grade_UV(cwvl)
         print('UV done')
         out1[:,3] += Grade_Zeeman(cwvl,wvlOvr,ovrlp)
         print('Zeeman done')
@@ -555,7 +729,8 @@ def Plot_Stack(scores,stackL,wvl,atomicS,prevTok,wvlW = 1, uvSW = 1, prevTokW = 
     - atomicS: nparray- the atomic states for each stack
     - prevTok: nparray- the previous tokamak usage for each stack
     """
-    wvlOvl,ovrlp = Prep_Zeeman(zFilename, wvlD = 0.5, plot = True)
+    #wvlOvl,ovrlp = Prep_Zeeman(zFilename, wvlD = 0.5, plot = True)
+    wvlOvl,ovrlp = Load_H5_Zeeman(folder='broad_all_fixed',wvlD = 0.01,plot = True)
     scores[:,0] *= wvlW
     scores[:,1] *= prevTokW
     scores[:,2] *= uvSW
@@ -584,7 +759,7 @@ def Plot_Stack(scores,stackL,wvl,atomicS,prevTok,wvlW = 1, uvSW = 1, prevTokW = 
 
 
             Plot_Lines(cwvl,cas,None,a[j])
-            a[j].plot(wvlOvl, ovrlp, color='black', linewidth=2)
+            a[j].plot(wvlOvl, ovrlp, color='black', linewidth=1)
 
         #set the title with the total score and weighting
         total_score = weightS[i]
@@ -644,11 +819,12 @@ def Plot_Lines(wvl, spec, ion,ax = None):
     if ion is None:
         ion = np.array(['']*spec.shape[0])
 
-    height = -3
+    height = 10
 
     for i in range(wvl.shape[0]):
         cclr = wave_to_rgb(wvl[i])
         ax.vlines(wvl[i], 0,height,color=cclr)
+        #ax.vlines(wvl[i], color=cclr)
         ax.text(wvl[i]+12, 0.8, f'{spec[i]} {ion[i]}', rotation=0, ha='center', va='bottom', fontsize=11, color=cclr)
     ax.set_xlabel('Wavelength (nm)')
 
@@ -657,7 +833,9 @@ if __name__ == '__main__':
     filename = 'lines.xlsx'
     filename = 'sparc_line_ids_v1.xlsx'
     filename = 'sparc_line_ids_widths_v0.xlsx'
-    saveF = 'TestStack.npz'
+    zFolder = 'broad_all_fixed'
+    zFile = 'broad_all_fixed/wavelengths.csv'
+    saveF = 'TestStack_broadfixed.npz'  #new name so results from the old buggy broad/ data are kept
     
     stackL =[ ['B','He','O'],['N','C','B','W']]
     stackL = [['O', 'N', 'C', 'B', 'He'],\
@@ -672,18 +850,18 @@ if __name__ == '__main__':
     stackL = [['O', 'N', 'C', 'B', 'He'],\
             ['W', 'Mo', 'Fe', 'Ni', 'Cu', 'Al'],\
             ['He', 'Ni', 'Mo', 'Al', 'C', 'N' ],]
-    #wvl, spec, ion, prevTok= Load_data(filename)
-    #outWvl, outAS, outPT = Filter_Stacks(stackL,wvl, spec, ion, prevTok)
-    #Save_Stack('TestStack', outWvl,outAS,outPT)
+    #regenerate wavelengths.csv (low/high/center of each Zeeman-split peak)
+    #from the fixed term-grouped h5 dataset
+    Load_H5_Zeeman(folder=zFolder,wvlD = 0.01,plot = False)
 
-    #outWvl,outAS,outPT = Load_Stack(saveF)
+    wvl, spec, ion, prevTok= Load_data(filename)
+    outWvl, outAS, outPT = Filter_Stacks(stackL,wvl, spec, ion, prevTok)
 
-    #scores = Grade_Stack(stackL, outWvl, outAS, outPT,filename)
-    #Save_GradedStack(saveF, outWvl,outAS,outPT,scores)
+    scores = Grade_Stack(stackL, outWvl, outAS, outPT,zFile)
+    Save_GradedStack(saveF, outWvl,outAS,outPT,scores)
 
-    outWvl, outAS, outPT, scores = Load_GradedStack(saveF)
+    #outWvl, outAS, outPT, scores = Load_GradedStack(saveF)
 
-    Plot_Stack(scores, stackL, outWvl, outAS, outPT,prevTokW = 0.5,uvSW = 2,zW = 1,zFilename = filename)
+    #Plot_Stack(scores, stackL, outWvl, outAS, outPT,prevTokW = 0.5,uvSW = 2,zW = 1,zFilename = zFile)
 
     #Plot_lines(wvl, spec, ion)
-
