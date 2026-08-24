@@ -834,6 +834,7 @@ if __name__ == '__main__':
     filename = 'sparc_line_ids_v1.xlsx'
     filename = 'sparc_line_ids_widths_v0.xlsx'
     zFolder = 'broad_all_fixed'
+    zFolder = 'split_ext_field_50_terms_h5'
     zFile = 'broad_all_fixed/wavelengths.csv'
     saveF = 'TestStack_broadfixed.npz'  #new name so results from the old buggy broad/ data are kept
     
