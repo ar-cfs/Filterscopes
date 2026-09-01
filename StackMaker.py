@@ -7,6 +7,8 @@ from time import time
 import drjit as dr
 import h5py
 import os
+import re
+from fractions import Fraction
 from scipy.signal import find_peaks
 
 
@@ -261,8 +263,293 @@ def Prep_Zeeman(filename, wvlD = 0.1, plot = False):
 
     return wvlOvlp,ovrlp
 
-def Load_xlsx(filename):
-    data = pd.read_excel(filename, sheet_name='Sheet1',header = 0,usecols = [1,2,3,12,13,14,16])
+#---------------------------------------------------------------------------
+# Zeeman width estimation
+#
+# Curt's h5 term files only cover part of the candidate line list. For the rest
+# we estimate the Zeeman envelope width from the atomic terms so that
+# Grade_Zeeman sees an envelope for every line instead of silently treating an
+# uncomputed line as "no overlap". Measured h5 widths always take precedence;
+# these estimates only fill gaps (see Merge_Zeeman_Catalog).
+#
+# References for the physics used below (all standard, textbook results):
+#
+# [1] Lande g-factor, g = 1 + [J(J+1)+S(S+1)-L(L+1)]/[2J(J+1)]:
+#     E. U. Condon and G. H. Shortley, "The Theory of Atomic Spectra",
+#     Cambridge University Press (1935), Ch. XVI (Zeeman effect).
+#     R. D. Cowan, "The Theory of Atomic Structure and Spectra",
+#     University of California Press (1981), Sec. 16-2.
+#     C. J. Foot, "Atomic Physics", Oxford University Press (2005), Sec. 5.5.
+#
+# [2] Anomalous Zeeman component shifts, dnu = (m_u g_u - m_l g_l)*mu_B*B/(hc)
+#     with electric-dipole selection rules dm = 0 (pi), +-1 (sigma):
+#     Condon and Shortley [1] Ch. XVI; I. I. Sobelman, "Atomic Spectra and
+#     Radiative Transitions", 2nd ed., Springer (1992), Ch. 8.
+#     Plasma-diagnostics treatment: H. R. Griem, "Principles of Plasma
+#     Spectroscopy", Cambridge University Press (1997), Ch. 4.
+#     The coefficient mu_B/(hc) is the Lorentz unit, 0.4669 cm^-1/T
+#     (NIST CODATA "Bohr magneton in inverse meters per tesla", 46.686 m^-1/T);
+#     the constants below reproduce this to 4 significant figures.
+#
+# [3] lambda^2 scaling: wavenumber-to-wavelength conversion. With nu = 1/lambda,
+#     dnu/dlambda = -1/lambda^2, so |dLambda| = lambda^2 |dnu|. Since the Zeeman
+#     shift is constant in wavenumber [2], the split in WAVELENGTH grows as
+#     lambda^2 - which is why a flat "widest measured width" is not conservative
+#     in the near-IR. See e.g. Griem [3] or any spectroscopy text.
+#
+# NOTE: the two calibration numbers below (C_MAX_JK and the default `safety`
+# factor) are NOT from the literature. They are empirical, derived in this repo
+# from Curt's computed term files - see their comments for provenance.
+#---------------------------------------------------------------------------
+
+MU_B = 9.2740100783e-24   #Bohr magneton, J/T
+H_PL = 6.62607015e-34     #Planck constant, J s
+C_L  = 2.99792458e8       #speed of light, m/s
+
+#Fallback coefficient for lines whose terms are not LS coupled (jk / bracket
+#notation), where no Lande g-factor is defined. This is max(width/lambda^2)
+#measured across Curt's computed term files - set by C III 465.025 nm, whose
+#1001 pm envelope is the widest in the dataset - so scaling it by lambda^2
+#reproduces the conservative "widest line we have seen" width at any
+#wavelength. Plain max width would badly under-estimate the near-IR neutrals,
+#since Zeeman splitting in wavelength grows as lambda^2.
+C_MAX_JK = 4.63e-6        #1/nm
+
+#1% of peak on a Gaussian occurs at 1.288*FWHM either side of line centre.
+#LowHighCent measures Curt's envelopes at that same 1% threshold, so adding
+#this keeps estimates directly comparable with the measured widths.
+_TAIL_FWHM = 1.288
+
+_LMAP = {'S':0,'P':1,'D':2,'F':3,'G':4,'H':5,'I':6,'K':7}
+
+def Parse_Term(term):
+    """
+    Parse an LS term symbol into (S, L).
+    Handles a leading configuration letter ('a 5D', 'x 5F*') and a trailing
+    parity marker ('*'). Returns None for jk / bracket notation such as
+    '2[3/2]*' or for blank entries, which have no LS g-factor.
+    Inputs:
+    - term: str - the term symbol, e.g. '3D', '5F*', 'a 5D', '2[3/2]*'
+    Outputs:
+    - (S, L): tuple of floats, or None if the term is not LS coupled
+    """
+    if not isinstance(term, str):
+        return None
+    t = term.strip().rstrip('*').strip()
+    t = re.sub(r'^[a-z]\s*', '', t)          #drop 'a ', 'x ', 'd ' prefixes
+    m = re.fullmatch(r'(\d+)([SPDFGHIK])', t)
+    if not m:
+        return None                          #jk/bracket notation or unparseable
+    mult = int(m.group(1))
+    return ((mult - 1)/2.0, float(_LMAP[m.group(2)]))
+
+def Parse_J(j):
+    """
+    Parse a J value which may be written as a fraction ('3/2') or integer.
+    Returns None if it cannot be parsed.
+    """
+    try:
+        return float(Fraction(str(j).strip()))
+    except Exception:
+        return None
+
+def Lande_g(J, S, L):
+    """
+    Lande g-factor for an LS-coupled level. J = 0 levels do not split.
+    """
+    if J == 0:
+        return 0.0
+    return 1.0 + (J*(J+1) + S*(S+1) - L*(L+1))/(2*J*(J+1))
+
+def Zeeman_Pattern_Extent(jLow, gLow, jUpp, gUpp):
+    """
+    Largest |m_upp*g_upp - m_low*g_low| over the allowed dipole components
+    (delta m = 0, +-1), i.e. how far the outermost Zeeman component sits from
+    line centre in units of the Lorentz unit.
+    Inputs:
+    - jLow, jUpp: float - the J values of the lower and upper levels
+    - gLow, gUpp: float - the corresponding Lande g-factors
+    Outputs:
+    - extent: float - max shift in Lorentz units (mu_B*B/hc)
+    """
+    extent = 0.0
+    ml = -jLow
+    while ml <= jLow + 1e-9:
+        for dm in (-1, 0, 1):
+            mu = ml + dm
+            if abs(mu) <= jUpp + 1e-9:
+                extent = max(extent, abs(mu*gUpp - ml*gLow))
+        ml += 1
+    return extent
+
+def Est_Zeeman_Width(wvl, termLow, jLow, termUpp, jUpp, bField = 12.5,
+                     fwhm = 0.01, safety = 1.9, cMax = C_MAX_JK):
+    """
+    Estimate the full Zeeman envelope width (nm) of each line, matching the
+    definition LowHighCent measures on Curt's spectra (outermost components
+    plus the 1% instrument tails).
+
+    Two tiers:
+    - LS-coupled terms: analytic Lande pattern. Validated against the 80 lines
+      Curt has computed, where measured/analytic has a median of 0.99 but
+      scatters up to ~2.9 because neighbouring J components blend into one
+      envelope. The safety factor (95th percentile of that ratio) keeps the
+      estimate on the conservative side.
+    - jk / bracket-coupled or unparseable terms: no valid g-factor exists, so
+      fall back to cMax*lambda^2, the widest width/lambda^2 seen in the
+      computed data (see C_MAX_JK).
+
+    Inputs:
+    - wvl: nparray (n) - line wavelengths in nm
+    - termLow, termUpp: nparray (n) of str - lower/upper term symbols
+    - jLow, jUpp: nparray (n) - lower/upper J values (may be '3/2' style str)
+    - bField: float - field strength in tesla (12.5 T = 125 kG, as Curt used)
+    - fwhm: float - instrument FWHM in nm used in Curt's calculation
+    - safety: float - multiplier applied to the analytic tier only
+    - cMax: float - fallback max(width/lambda^2) in 1/nm for non-LS terms
+    Outputs:
+    - width: nparray (n) - estimated envelope width in nm
+    - method: nparray (n) of str - 'analytic-Lande' or 'lambda2-scaled max'
+    """
+    wvl = np.atleast_1d(np.asarray(wvl, dtype=float))
+    termLow = np.atleast_1d(np.asarray(termLow, dtype=object))
+    termUpp = np.atleast_1d(np.asarray(termUpp, dtype=object))
+    jLow = np.atleast_1d(np.asarray(jLow, dtype=object))
+    jUpp = np.atleast_1d(np.asarray(jUpp, dtype=object))
+
+    #Lorentz unit mu_B*B/(hc) in 1/m, converted so that
+    #dLambda[nm] = lambda[nm]^2 * kNm * shift
+    kNm = (MU_B*bField/(H_PL*C_L))*1e-9
+    tail = 2*_TAIL_FWHM*fwhm
+
+    width = np.zeros(wvl.shape[0])
+    method = np.empty(wvl.shape[0], dtype=object)
+
+    for i in range(wvl.shape[0]):
+        tl, tu = Parse_Term(termLow[i]), Parse_Term(termUpp[i])
+        jl, ju = Parse_J(jLow[i]), Parse_J(jUpp[i])
+
+        if tl is None or tu is None or jl is None or ju is None:
+            #not LS coupled - use the conservative lambda^2-scaled maximum
+            width[i] = cMax*wvl[i]**2
+            method[i] = 'lambda2-scaled max'
+        else:
+            gl = Lande_g(jl, tl[0], tl[1])
+            gu = Lande_g(ju, tu[0], tu[1])
+            extent = Zeeman_Pattern_Extent(jl, gl, ju, gu)
+            width[i] = safety*(2*extent*wvl[i]**2*kNm) + tail
+            method[i] = 'analytic-Lande'
+
+    return width, method
+
+def Merge_Zeeman_Catalog(folder, xlsxFile, tol = 0.1, saveCSV = True,
+                         verbose = True, **estKw):
+    """
+    Build the full Zeeman overlap catalog that Grade_Zeeman works from, by
+    combining:
+      1. Curt's MEASURED envelopes  - every peak in <folder>/wavelengths.csv,
+         produced by Load_H5_Zeeman/LowHighCent from the h5 term files.
+      2. ESTIMATED envelopes        - for candidate lines in the spreadsheet
+         that have no computed counterpart in the h5 files at all.
+
+    Measured always wins: a spreadsheet line is only given an estimated
+    envelope if no h5 file lists it among its NIST lines. This stops
+    uncomputed lines from looking like empty spectrum to Grade_Zeeman.
+
+    Note the two inputs cover different things and that is intentional. The h5
+    catalog contains every J-resolved peak Curt computed, including many not in
+    the spreadsheet; the estimates cover spreadsheet lines Curt has not reached
+    yet. Both are contamination sources, so both belong in the catalog
+    regardless of the 1 nm downselect applied to the selectable line list.
+
+    Inputs:
+    - folder: str - folder holding the h5 term files AND wavelengths.csv
+    - xlsxFile: str - the candidate line list spreadsheet
+    - tol: float - nm tolerance for matching a spreadsheet line to a NIST line
+    - saveCSV: bool - write zeeman_catalog.csv into folder for inspection
+    - verbose: bool - print a coverage summary
+    - estKw: passed through to Est_Zeeman_Width (bField, safety, cMax, ...)
+    Outputs:
+    - center, low, high: nparray - envelope centre and edges (nm) for every
+      entry, ready for Process_Zeeman
+    - isEst: nparray of bool - True where the entry is an estimate
+    """
+
+    #---- 1. measured envelopes from the h5 term files --------------------
+    meas = pd.read_csv(os.path.join(folder, 'wavelengths.csv'))
+
+    #---- which lines has Curt actually computed? -------------------------
+    #Use the nist_lines groups rather than the peak centres: a term file lists
+    #every J-resolved line it covers, which is what "computed" really means.
+    computed = []
+    for f in os.listdir(folder):
+        if not f.endswith('.h5'):
+            continue
+        with h5py.File(os.path.join(folder, f), 'r') as h:
+            el = h.attrs['element']
+            ch = int(h.attrs['charge'])
+            if 'nist_lines' not in h:
+                continue
+            obs = h['nist_lines']['observed_wavelength_nm'][:]
+            ritz = h['nist_lines']['ritz_wavelength_nm'][:]
+        #prefer observed, fall back to ritz (Kr II / Mo I have ritz all NaN)
+        for o, r in zip(obs, ritz):
+            w = o if not np.isnan(o) else r
+            if not np.isnan(w):
+                computed.append((el, ch, float(w)))
+
+    #---- 2. estimated envelopes for spreadsheet lines with no h5 data ----
+    xWvl, xSpec, _, xIon, _, xWidth, xMethod = Load_xlsx(xlsxFile)
+    if estKw:
+        #recompute with caller's settings (Load_xlsx uses the defaults)
+        data = pd.read_excel(xlsxFile, sheet_name='Sheet1', header=0,
+                             usecols=[1,2,3,5,6,9,10,12,13,14,16])
+        xWidth, xMethod = Est_Zeeman_Width(xWvl, data['term_low'], data['j_low'],
+                                           data['term_upp'], data['j_upp'], **estKw)
+
+    eCen, eLow, eHigh, eLbl = [], [], [], []
+    seen = set()
+    for i in range(xWvl.shape[0]):
+        el, ch, w = xSpec[i], int(xIon[i]), float(xWvl[i])
+        #the spreadsheet has a few duplicated rows - do not double count them
+        if (el, ch, round(w, 3)) in seen:
+            continue
+        seen.add((el, ch, round(w, 3)))
+
+        if any(cel == el and cch == ch and abs(cw - w) <= tol
+               for cel, cch, cw in computed):
+            continue                       #measured data exists, skip estimate
+
+        eCen.append(w)
+        eLow.append(w - xWidth[i]/2.0)
+        eHigh.append(w + xWidth[i]/2.0)
+        eLbl.append(f'{el}_{ch}_{w:.3f}_EST_{xMethod[i]}')
+
+    #---- 3. combine ------------------------------------------------------
+    center = np.concatenate([meas['center'].values, np.asarray(eCen)])
+    low    = np.concatenate([meas['low'].values,    np.asarray(eLow)])
+    high   = np.concatenate([meas['high'].values,   np.asarray(eHigh)])
+    isEst  = np.concatenate([np.zeros(len(meas), bool), np.ones(len(eCen), bool)])
+
+    if verbose:
+        print(f'Zeeman catalog: {len(meas)} measured peaks + {len(eCen)} estimated '
+              f'envelopes = {len(center)} entries')
+        if len(eCen):
+            print(f'  estimated widths (nm): min {np.min(np.asarray(eHigh)-np.asarray(eLow)):.3f} '
+                  f'median {np.median(np.asarray(eHigh)-np.asarray(eLow)):.3f} '
+                  f'max {np.max(np.asarray(eHigh)-np.asarray(eLow)):.3f}')
+
+    if saveCSV:
+        pd.DataFrame({'file': list(meas['file']) + eLbl,
+                      'low': low, 'high': high, 'center': center,
+                      'estimated': isEst}).to_csv(
+            os.path.join(folder, 'zeeman_catalog.csv'), index=False)
+
+    return center, low, high, isEst
+
+def Load_xlsx(filename, prevTokCol = 'Prev_Tok'):
+    data = pd.read_excel(filename, sheet_name='Sheet1',header = 0,
+                         usecols = [1,2,3,5,6,9,10,12,13,14,15,16])
     wvl = np.array(data['wave']).astype(float)
     spec = np.array(data['element']).astype(str)
     ion = np.array(data['charge']).astype(str)
@@ -287,20 +574,29 @@ def Load_xlsx(filename):
     ion = ion[~mask]
     """
     
-    width = np.array(data['Zee_width (nm)']).astype(float)
+    #Estimated Zeeman envelope width for every line, from the atomic terms.
+    #This replaces the old random-filler widths, which were unseeded (so runs
+    #were not reproducible) and assigned widths sampled from unrelated lines.
+    #The 'Zee_width (nm)' column in the spreadsheet is deliberately NOT used:
+    #it only covers 22 N II/N III lines and disagrees with the current h5
+    #calculation by 0.1x-3.1x, i.e. it predates the term-based dataset.
+    #Measured h5 widths win over these estimates in Merge_Zeeman_Catalog.
+    width, method = Est_Zeeman_Width(wvl, data['term_low'], data['j_low'],
+                                     data['term_upp'], data['j_upp'])
 
-    ###
-    #place filler while Curt is working on getting zeeman widths
-    mask = np.isnan(width)
-    tempW = np.unique(width[~mask])
+    #Previously fielded on a tokamak. Marked 'Y' in the spreadsheet, blank
+    #otherwise, so anything that is not a 'Y' counts as unused. Returned as a
+    #real boolean array - this used to be hardcoded to all-False, which made
+    #Grade_PrevTok score 0 for every stack.
+    if prevTokCol in data.columns:
+        prevTok = (data[prevTokCol].astype(str).str.strip().str.upper()
+                   == 'Y').to_numpy()
+    else:
+        print(f"WARNING: no '{prevTokCol}' column in {filename}; "
+              f"previous-tokamak score will be 0 for every stack")
+        prevTok = np.zeros(wvl.shape[0], dtype=bool)
 
-    #randomly assign widths from the non-nan values to the nan values
-    width[mask] = np.random.choice(tempW, size=np.sum(mask), replace=True)
-    ###
-
-    prevTok = np.full_like(species, False, dtype=bool)
-
-    return wvl, spec, species, ion, prevTok,width
+    return wvl, spec, species, ion, prevTok,width,method
 
 
 def Load_data(filename):
@@ -314,6 +610,12 @@ def Load_data(filename):
     - species: nparray- the species of the lines
     - ion: nparray- the ionization state of the lines
     - prevTok: nparray- boolean array indicating if the line was used in a tokamak
+
+    Note: estimated Zeeman widths are deliberately NOT returned here. The
+    overlap catalog needs every line in the spreadsheet, including ones this
+    function drops in the 1 nm downselect (a dropped line still emits and can
+    still contaminate a neighbour, it just is not separately selectable), so
+    Merge_Zeeman_Catalog goes to Load_xlsx for the full list instead.
     """
 
     """
@@ -337,7 +639,7 @@ def Load_data(filename):
     print('unique lines:', wvl.shape[0])
     """
 
-    wvl, spec, species, ion, prevTok,_ = Load_xlsx(filename)
+    wvl, spec, species, ion, prevTok,_,_ = Load_xlsx(filename)
 
 
 
@@ -399,9 +701,14 @@ def Load_data(filename):
 
 
 
-    #convert prevtok to a boolean array
-    prevOut = np.full(len(prevTok), False, dtype=bool)
-    prevOut[prevTok == 'Y'] = True
+    #Load_xlsx already returns a boolean. The old code here compared this
+    #array against the string 'Y', which is False for a bool array and so
+    #zeroed the flag even once the column was being read. Kept tolerant of a
+    #string column in case the loader is ever pointed at the older sheets.
+    if prevTok.dtype == bool:
+        prevOut = prevTok
+    else:
+        prevOut = (np.char.upper(prevTok.astype(str).astype('U')) == 'Y')
 
     return wvl, spec, ion, prevOut
 
@@ -496,13 +803,203 @@ def Filter_Stacks(stackL,wvl,spec,ion,prevTok):
 
     return outWvl, outAS, outPT
 
-def Grade_Zeeman(wvl, overWvl, Overlap, plot=False, chunkN = 20_000_000):
+def Line_Envelopes(lineWvl, cen, low, high, tol = 0.5):
     """
-    Memory-efficient version of Grade_Zeeman.
-    Processes the combination axis in chunks of chunkN so no single
-    host-pinned/GPU allocation exceeds a few hundred MB (a 6-species x 98M
-    combination stack needs a 4 GB pinned transfer in one shot, which the
+    Find each candidate line's OWN Zeeman envelope in the catalog.
+
+    Prefers an entry that actually contains the line (nearest centre among
+    those), otherwise falls back to the nearest centre within tol. Lines with
+    no match get NaN, which Zeeman_Line_Scores treats as "no Zeeman data".
+
+    Inputs:
+    - lineWvl: nparray (n) - candidate line wavelengths in nm
+    - cen, low, high: nparray (m) - catalog envelope centres and edges
+    - tol: float - max nm from a catalog centre to still call it the same line
+    Outputs:
+    - lineLow, lineHigh: nparray (n) - the line's own envelope, NaN if none
+    """
+    lineWvl = np.asarray(lineWvl, dtype=float)
+    cen, low, high = np.asarray(cen), np.asarray(low), np.asarray(high)
+
+    lineLow = np.full(lineWvl.shape[0], np.nan)
+    lineHigh = np.full(lineWvl.shape[0], np.nan)
+    for i, w in enumerate(lineWvl):
+        inside = (low <= w) & (high >= w)
+        if inside.any():
+            j = np.flatnonzero(inside)[np.argmin(np.abs(cen[inside] - w))]
+        else:
+            j = int(np.argmin(np.abs(cen - w)))
+            if abs(cen[j] - w) > tol:
+                continue                    #no data for this line
+        lineLow[i], lineHigh[i] = low[j], high[j]
+    return lineLow, lineHigh
+
+def Zeeman_Line_Scores(lineWvl, cen, low, high, mode = 'envelope', tol = 0.5):
+    """
+    Exact Zeeman blend score for each candidate line. The score is -(count-1),
+    where count includes the line's own envelope: 0 when the line sits alone,
+    -1 when one other line blends with it, and so on. A line with no Zeeman
+    data at all scores 0, so missing data is neutral rather than rewarded.
+
+    Two definitions of "blended", selected by `mode`:
+
+    - 'envelope' (default, CONSERVATIVE): the line's own Zeeman envelope
+      INTERSECTS another line's envelope. This is the right question for a
+      filter stack - if two broadened profiles touch at all, a bandpass around
+      one admits some of the other, even when neither line centre is buried.
+      Catches cases like Fe III 411.986, whose envelope overlaps B II 412.193
+      while its centre sits just outside B II's envelope.
+
+    - 'center': another line's envelope contains this line's CENTRE, i.e. the
+      line is substantially buried rather than merely touching. Less strict,
+      so more lines come back clean. Kept as a fallback for when the
+      conservative test leaves too few acceptable stacks to choose between.
+
+    On the current data 'envelope' flags 40 of 106 selectable lines and
+    'center' flags 25, so the conservative mode still discriminates rather
+    than condemning everything.
+
+    IMPORTANT: cen/low/high must be the FULL catalog from Merge_Zeeman_Catalog
+    - every measured h5 peak plus an estimated envelope for every uncomputed
+    spreadsheet line. Contamination has to be counted against every line that
+    physically emits, not just the subset that survives Load_data's 1 nm
+    downselect: a line dropped there is merely not separately SELECTABLE, it
+    still sits in the plasma and still blends into its neighbours.
+
+    Inputs:
+    - lineWvl: nparray (n) - candidate line wavelengths in nm (exact, float64)
+    - cen, low, high: nparray (m) - catalog envelope centres and edges in nm
+    - mode: 'envelope' (conservative) or 'center'
+    - tol: float - passed to Line_Envelopes when mode='envelope'
+    Outputs:
+    - score: nparray (n) float32 - per-line blend score, <= 0
+    - count: nparray (n) int - envelopes blended with each line, own included
+    """
+    lineWvl = np.asarray(lineWvl, dtype=float)
+    low, high = np.asarray(low), np.asarray(high)
+
+    if mode == 'center':
+        count = ((lineWvl[:,None] >= low[None,:]) &
+                 (lineWvl[:,None] <= high[None,:])).sum(1)
+    elif mode == 'envelope':
+        lLow, lHigh = Line_Envelopes(lineWvl, cen, low, high, tol = tol)
+        #two intervals intersect unless one ends before the other starts.
+        #NaN (no data for this line) compares False, giving count 0 -> score 0
+        count = ((lLow[:,None] <= high[None,:]) &
+                 (lHigh[:,None] >= low[None,:])).sum(1)
+    else:
+        raise ValueError(f"mode must be 'envelope' or 'center', got {mode!r}")
+
+    score = np.minimum(1 - count, 0).astype(np.float32)
+    return score, count
+
+def Zeeman_Line_LUT(lineWvl, lineSpec, uspec, cen, low, high,
+                    mode = 'envelope', tol = 0.5):
+    """
+    Build a float16-indexed lookup table of per-line Zeeman scores, one row per
+    species, so Grade_Zeeman can score a stack with a plain gather.
+
+    Filter_Stacks stores the combination wavelengths as float16, so every value
+    in row i of that array is the float16 image of one of species uspec[i]'s
+    lines. Reinterpreting those 16 bits as a uint16 gives a direct index into a
+    65536-entry table - exact, and far cheaper than searching a wavelength grid.
+
+    The table is built PER SPECIES rather than globally because two lines of
+    different species can round to the same float16 value (e.g. He I 667.815
+    and Ne I 667.828). Within one species Load_data's downselect guarantees
+    lines are more than 1 nm apart, comfortably wider than float16 spacing
+    (<= 0.5 nm here), so a per-species table can never be ambiguous.
+
+    Inputs:
+    - lineWvl: nparray (n) - candidate line wavelengths (exact)
+    - lineSpec: nparray (n) of str - the element of each candidate line
+    - uspec: sequence (k) of str - species in row order of the combination array
+    - cen, low, high: nparray (m) - full catalog (see Zeeman_Line_Scores)
+    - mode: 'envelope' (conservative, default) or 'center' - see Zeeman_Line_Scores
+    - tol: float - passed through to Zeeman_Line_Scores
+    Outputs:
+    - lut: nparray (k, 65536) float32 - lut[i, code] = score of that line
+    - score: nparray (n) float32 - the per-line scores, for inspection
+    - count: nparray (n) int - envelopes blended with each line, for inspection
+    """
+    score, count = Zeeman_Line_Scores(lineWvl, cen, low, high, mode = mode, tol = tol)
+    lineWvl = np.asarray(lineWvl, dtype=float)
+    lineSpec = np.asarray(lineSpec)
+
+    lut = np.zeros((len(uspec), 65536), dtype=np.float32)
+    for i, s in enumerate(uspec):
+        m = lineSpec == s
+        codes = np.ascontiguousarray(lineWvl[m].astype(np.float16)).view(np.uint16)
+        if len(np.unique(codes)) != len(codes):
+            print(f'WARNING: float16 collision within species {s}; '
+                  f'Zeeman scores for it may be wrong')
+        lut[i, codes] = score[m]
+    return lut, score, count
+
+def Grade_Zeeman(wvl, lut, chunkN = 20_000_000):
+    """
+    Score each stack on how much its lines are blended with other survey lines
+    by Zeeman broadening. 0 is perfect (every chosen line sits alone in its own
+    envelope) and each additional line blended with a chosen line costs -1, so
+    the score is <= 0.
+
+    This is an exact evaluation: the per-line scores in `lut` were computed by
+    counting catalog envelopes containing each line's true wavelength (see
+    Zeeman_Line_Scores), so scoring a stack is just a gather and a sum.
+
+    It replaces an earlier version that searched a uniform 0.25 nm wavelength
+    grid on the GPU for the nearest grid point. That was both slow (cost grew
+    linearly with grid size, so a fine grid was unaffordable) and wrong at this
+    resolution: overlap bands are only ~0.2-0.4 nm wide, so the nearest grid
+    point routinely fell outside the very overlap it was meant to detect. Ni I
+    471.442 sits inside He I's 471.180-471.477 envelope, but the nearest grid
+    point was 471.513 - past its edge - so the whole W/Mo/Fe/Ni/Cu/Al stack
+    scored a flat 0. Grade_Zeeman_Grid below is kept for reference.
+
+    Inputs:
+    - wvl: nparray (k, nCombos) float16 - stack wavelengths from Filter_Stacks
+    - lut: nparray (k, 65536) float32 - per-species score table, rows aligned
+      with wvl, from Zeeman_Line_LUT
+    - chunkN: int - combinations per chunk, to bound peak memory
+    Outputs:
+    - out: nparray (nCombos) float32 - Zeeman score per stack, <= 0
+    """
+    if wvl.dtype != np.float16:
+        raise TypeError('Grade_Zeeman expects the float16 combination array '
+                        'that Filter_Stacks produces, so the lut indices line up')
+
+    ncomb = wvl.shape[-1]
+    out = np.zeros(ncomb, dtype=np.float32)
+
+    for s in range(0, ncomb, chunkN):
+        e = min(s + chunkN, ncomb)
+        #reinterpret the float16 bits as uint16 to index the table directly
+        codes = np.ascontiguousarray(wvl[:, s:e]).view(np.uint16)
+        for r in range(wvl.shape[0]):
+            out[s:e] += lut[r][codes[r]]
+
+    return out
+
+def Grade_Zeeman_Grid(wvl, overWvl, Overlap, plot=False, chunkN = 20_000_000):
+    """
+    LEGACY nearest-grid-point version of Grade_Zeeman, kept for reference and
+    for the Prep_Zeeman path in Grade_Stack. Prefer Grade_Zeeman: this one is
+    only as accurate as the wavelength grid it is handed, and at the 0.25 nm
+    spacing Grade_Stack used it silently missed most real overlaps.
+
+    Memory-efficient: processes the combination axis in chunks of chunkN so no
+    single host-pinned/GPU allocation exceeds a few hundred MB (a 6-species x
+    98M combination stack needs a 4 GB pinned transfer in one shot, which the
     driver refuses).
+
+    Per-line contribution is clipped at 0. Overlap is -n where n envelopes
+    cover a wavelength, so a line alone in its own envelope reads -1 and
+    contributes -1+1 = 0. A line at a wavelength with NO catalog envelope at
+    all reads 0, which without the clip would contribute +1 - i.e. the old
+    scoring actively REWARDED lines whose Zeeman width had never been
+    calculated, and the metal stacks scored well largely because Fe/Ni/Cu/Al
+    had no data. Clipping makes "no data" merely neutral rather than better
+    than a clean, well-characterised line.
     """
     import drjit as dr
 
@@ -534,8 +1031,9 @@ def Grade_Zeeman(wvl, overWvl, Overlap, plot=False, chunkN = 20_000_000):
 
         #convert back to numpy array
         idxArr = np.array(idx,dtype=int)
-        #sums the overlap values for each possible stack
-        out[s:e] = np.take(Overlap, idxArr).sum(0)+ wvl.shape[0]  #add wvl.shape[0] to make 0 no overlap and -n overlap of n lines
+        #+1 cancels each line's own envelope; clipping at 0 stops lines with no
+        #Zeeman data (overlap 0) from scoring better than isolated lines
+        out[s:e] = np.minimum(np.take(Overlap, idxArr) + 1, 0).sum(0)
 
         del idx, smllD, wvlT, diff, mask
         dr.flush_malloc_cache()  #release cached GPU/pinned memory before the next chunk
@@ -543,34 +1041,55 @@ def Grade_Zeeman(wvl, overWvl, Overlap, plot=False, chunkN = 20_000_000):
 
     return out
 
-def Grade_Wvl(wvl,clip = 30):
+def Grade_Wvl(wvl, clip = 30, gBS = 2.0, dichFloor = 0.85, bsScore = 0.25):
     """
-    Grade the wavelength based on the spacing between lines
-    Captures abilitiy to buy a dichoric filter to split the lines in wvl
-    returns a score for each possible stack between 0 and 1
+    Grade a stack on how easily its lines can be optically separated onto
+    separate channels. Every adjacent pair (in sorted wavelength order) needs
+    its own split, so we score each gap and average over the (nLines-1) splits.
+
+    Separation is never impossible, so this is a soft cost gradient with a
+    floor, not a hard pass/fail:
+    - gap >= clip (30 nm): standard/cheap dichroic, full light -> score 1.0
+    - gBS <= gap < clip:   dichroic still works at full light but needs a
+      sharper/pricier edge as the gap shrinks -> linear 1.0 down to dichFloor
+      (a "this costs more money" penalty, light throughput still ~full)
+    - gap < gBS:           too tight for any practical dichroic edge, fall back
+      to a 50/50 beamsplitter + bandpass -> flat bsScore floor (acceptable, but
+      loses light). The step down at gBS reflects the hardware regime change.
+
+    Score per stack is in [bsScore, 1]. Averaging (not min) is used on purpose:
+    one beamsplitter pair is acceptable, so a single tight gap should only dent
+    the score, while a stack full of tight gaps (lots of lost light) should
+    score much lower.
+
     Inputs:
-    - wvl: nparray - (unique species, wavelength combinations) - the wavelengths of the lines
-    - clip: int - the maximum spacing between lines to be considered good, default is 30 nm
+    - wvl: nparray (nLines, nCombos) - the wavelengths of the lines in each stack
+    - clip: float - gap (nm) at/above which a cheap dichroic suffices (score 1)
+    - gBS: float - gap (nm) below which no practical dichroic edge exists and a
+      beamsplitter is required (dichroic->beamsplitter crossover)
+    - dichFloor: float - score at the gBS end of the dichroic regime (encodes
+      the added cost of the sharpest practical dichroic; ~full light so <1 but high)
+    - bsScore: float - score floor for the beamsplitter fallback (~light kept in
+      a 50/50 split, hence ~0.5)
     Outputs:
-    - out: nparray - (wavelength combinations) - the score for each stack, where 1 is perfect and 0 is bad
+    - out: nparray (nCombos) - mean separation score per stack, in [bsScore, 1]
     """
 
-    #sort wvl 
-    sWvl = np.sort(wvl,axis = 0)
-    """
+    #float32: ~2x faster than float16 here (no vectorized f16 arithmetic path)
+    #and restores real sub-nm resolution lost to float16's 0.25-0.5 nm quantization
+    sWvl = np.sort(wvl.astype(np.float32), axis = 0)
+    gaps = np.diff(sWvl, axis = 0)  #adjacent gaps (nm) in sorted order
 
-    mask = np.diff(sWvl,axis = 0)> clip
-    #med = np.median(np.diff(sWvl,axis = 0),axis = 0)/clip #any spacing greater than 100 nm is fine
+    #dichroic regime: linear from 1.0 at clip down to dichFloor at gBS
+    frac = np.clip((gaps - gBS) / (clip - gBS), 0.0, 1.0)
+    dich = dichFloor + (1.0 - dichFloor) * frac
 
-    #sum the mask to get the number of lines which are spaced more than 30 nm apart
-    out = np.sum(mask,axis = 0)/(sWvl.shape[0]-1)  #percentage of lines spaced more than 30 nm apart
-    """
+    #below gBS the split needs a beamsplitter -> flat floor
+    score = np.where(gaps >= gBS, dich, np.float32(bsScore))
 
-    #alternatively, create a linear function which punishes lines below 30 nm
-    out = np.clip(np.diff(sWvl,axis = 0),None,clip) / clip  #clip the spacing to be below 30 nm and normalize by 30 nm
-    out = out.sum(0)/(sWvl.shape[0]-1)
+    out = score.mean(0)  #mean over the (nLines-1) splits, comparable across stack sizes
 
-    return out #return the minimum of the median spacing or 1 (100% score)
+    return out
 
 def Grade_PrevTok(prevTok):
     """
@@ -608,7 +1127,8 @@ def Grade_UV(wvl,cutoff = 450,lwvl = 350):
     #np.sum(wvl > cutoff,axis = 0)/wvl.shape[0] 
     return out  
 
-def Grade_Stack(stackL, wvl, atomicS, prevTok,filename,lowMem = True):
+def Grade_Stack(stackL, wvl, atomicS, prevTok,filename,lowMem = True,
+                zFolder = None, xlsxFile = None, zMode = 'envelope', **mergeKw):
     """
     Grade the stack based on the wavelength, atomic state and previous tokamak usage
     Returns a score for each line in the stack
@@ -619,6 +1139,16 @@ def Grade_Stack(stackL, wvl, atomicS, prevTok,filename,lowMem = True):
     - wvl: nparray - (unique species, wavelength combinations) - the wavelengths of the lines
     - atomicS: nparray - (unique species, wavelength combinations) - the species and ionization state of the lines
     - prevTok: nparray - (unique species, wavelength combinations) - boolean array indicating if the line was used in a tokamak
+    - filename: str - wavelengths.csv, used only on the legacy path (see zFolder)
+    - zFolder: str or None - folder of h5 term files. If given together with
+      xlsxFile, the Zeeman catalog is built by Merge_Zeeman_Catalog (measured
+      envelopes plus estimates for uncomputed lines). If None, falls back to
+      the legacy measured-only catalog read from `filename`.
+    - xlsxFile: str or None - candidate line list spreadsheet, needed with zFolder
+    - zMode: 'envelope' (default, conservative: Zeeman envelopes intersect) or
+      'center' (line centre buried under another envelope). Switch to 'center'
+      if the conservative test leaves too few clean stacks to choose between.
+    - mergeKw: passed to Merge_Zeeman_Catalog (tol, bField, safety, cMax, ...)
     Outputs:
     - out: nparray - (wavelength combinations, 3) - the scores for each stack, where the first column is the wavelength score,
      the second column is the previous tokamak usage score and the third column is the UV score
@@ -629,9 +1159,6 @@ def Grade_Stack(stackL, wvl, atomicS, prevTok,filename,lowMem = True):
     #2) previous tokamak usage
     #3) number of lines below a certain wavelength
 
-    
-    #setup the overlap and wavelength arrays
-    wvlOvr,ovrlp = Prep_Zeeman(filename, wvlD = 0.25, plot = True)
 
     #spec = np.array([s.split(' ')[0] for s in atomicS])
 
@@ -640,6 +1167,29 @@ def Grade_Stack(stackL, wvl, atomicS, prevTok,filename,lowMem = True):
 
     #all the same for each row, so we can just use the first row
     cspec = np.array([s.split(' ')[0] for s in atomicS[:,0]])
+
+    #setup the Zeeman scoring
+    if zFolder is not None and xlsxFile is not None:
+        #measured h5 envelopes + estimated envelopes for lines Curt has not
+        #computed, so uncomputed lines are not invisible to Grade_Zeeman.
+        #The catalog spans the FULL spreadsheet, not the downselected lines.
+        cen, low, high, _ = Merge_Zeeman_Catalog(zFolder, xlsxFile, **mergeKw)
+
+        #exact per-line scores, looked up by float16 bit pattern at grade time
+        lWvl, lSpec, _, _ = Load_data(xlsxFile)
+        lut, lScore, lCount = Zeeman_Line_LUT(lWvl, lSpec, cspec, cen, low, high,
+                                              mode = zMode)
+        print(f"Zeeman ({zMode} mode): {int((lScore!=0).sum())} of {len(lWvl)} "
+              f"selectable lines are blended with another line "
+              f"(worst {int(-lScore.min())} overlapping)")
+        if (lScore == 0).sum() == 0:
+            print("  WARNING: every selectable line is blended. Consider "
+                  "zMode='center' for the less strict centre-buried test.")
+        useLUT = True
+    else:
+        #legacy path: measured h5 envelopes only, nearest point on a 0.25 nm grid
+        wvlOvr,ovrlp = Prep_Zeeman(filename, wvlD = 0.25, plot = True)
+        useLUT = False
 
     #find the indexes of the speces in the stackL
     idx = [np.searchsorted(cspec, substack) for substack in stackL]
@@ -658,13 +1208,16 @@ def Grade_Stack(stackL, wvl, atomicS, prevTok,filename,lowMem = True):
         print(f'Grading stack {i+1}/{len(idx)}...')
 
 
-        #out1[:,0] += Grade_Wvl(cwvl)
+        out1[:,0] += Grade_Wvl(cwvl)
         print('wvl done')
-        #out1[:,1] += Grade_PrevTok(cpt)
+        out1[:,1] += Grade_PrevTok(cpt)
         print('Prev Tok done')
-        #out1[:,2] += Grade_UV(cwvl)
+        out1[:,2] += Grade_UV(cwvl)
         print('UV done')
-        out1[:,3] += Grade_Zeeman(cwvl,wvlOvr,ovrlp)
+        if useLUT:
+            out1[:,3] += Grade_Zeeman(cwvl, lut[idx[i]])
+        else:
+            out1[:,3] += Grade_Zeeman_Grid(cwvl,wvlOvr,ovrlp)
         print('Zeeman done')
 
         print(f'Stack {i+1} graded in {time()-t:.2f} seconds')
@@ -719,18 +1272,222 @@ def Grade_Stack(stackL, wvl, atomicS, prevTok,filename,lowMem = True):
 
     return out1
 
-def Plot_Stack(scores,stackL,wvl,atomicS,prevTok,wvlW = 1, uvSW = 1, prevTokW = 1,zW = 1,zFilename = 'sparc_line_ids_widths_v0.xlsx'):
+def Load_H5_Spectra(folder):
     """
-    Plot the scores for each stack
+    Load every term file's normalised Zeeman spectrum once, for plotting.
+    Unlike Load_H5_Zeeman this keeps the individual spectra rather than
+    summing them, so each can be drawn in its own colour.
+    Inputs:
+    - folder: str - folder of h5 term files
+    Outputs:
+    - spectra: list of dicts with w, s (normalised 0-1), cen (peak centres),
+      el, ch and a display label
+    """
+    spectra = []
+    for f in sorted(x for x in os.listdir(folder) if x.endswith('.h5')):
+        with h5py.File(os.path.join(folder, f), 'r') as h:
+            w = h['wave_air'][:]
+            s = h['signal'][:]
+            el = h.attrs['element']
+            ch = int(h.attrs['charge'])
+            src = float(h.attrs['source_line_nm'])
+        si = np.argsort(w)
+        w, s = w[si], s[si]
+        if np.any(np.isnan(s)) or s.max() == s.min():
+            continue
+        s = (s - s.min())/(s.max() - s.min())
+        low, high, cen = LowHighCent(w, s)
+        spectra.append(dict(w=w, s=s, cen=cen, el=el, ch=ch,
+                            lbl=f'{el} {ch} {src:.1f}'))
+    return spectra
+
+def Plot_Zeeman_Spectra(ax, spectra, selWvl, window = 3.0, height = 3.0,
+                        cmap = 'hsv', nCycle = 9, label = True):
+    """
+    Draw the Zeeman spectra sitting near a stack's selected lines, each in its
+    own colour from a cycling colour wheel.
+
+    Only the parts of a spectrum within `window` nm of a selected line are
+    drawn - plotting the whole 300-900 nm survey in every panel buries the
+    detail that matters, which is what sits right next to the chosen lines.
+    Everything outside the window is set to NaN so matplotlib breaks the trace
+    rather than joining across the gap.
+
+    Inputs:
+    - ax: matplotlib axis to draw on
+    - spectra: list from Load_H5_Spectra
+    - selWvl: nparray - the wavelengths selected for this stack
+    - window: float - nm either side of a selected line to draw
+    - height: float - plot height for a fully normalised (1.0) spectrum
+    - cmap: str - cyclic colour map used to tell neighbouring lines apart
+    - nCycle: int - how many colours before the wheel repeats
+    - label: bool - annotate each drawn spectrum with its term-file label
+    Outputs:
+    - drawn: list of the spectra that were close enough to plot
+    """
+    selWvl = np.atleast_1d(np.asarray(selWvl, dtype=float))
+    cm = plt.get_cmap(cmap)
+
+    #a spectrum is worth drawing if any of its peaks is near a selected line
+    drawn = [sp for sp in spectra
+             if len(sp['cen']) and
+             np.any(np.abs(np.asarray(sp['cen'])[:,None] - selWvl[None,:]) <= window)]
+
+    def nearestPeak(sp):
+        """The spectrum's peak lying closest to any of the selected lines."""
+        cen = np.asarray(sp['cen'])
+        return float(cen[np.abs(cen[:,None] - selWvl[None,:]).min(1).argmin()])
+
+    #order left to right so the staggered labels read in wavelength order
+    drawn.sort(key=nearestPeak)
+
+    for k, sp in enumerate(drawn):
+        #hsv straight off the wheel puts near-white yellows on a white page,
+        #so pull the value down a little to keep every colour legible
+        r, g, b, _ = cm((k % nCycle)/nCycle)
+        col = (r*0.82, g*0.82, b*0.82)
+
+        near = np.any(np.abs(sp['w'][:,None] - selWvl[None,:]) <= window, axis=1)
+        y = np.where(near, sp['s']*height, np.nan)
+        ax.plot(sp['w'], y, color=col, lw=1.1, zorder=6)
+        ax.fill_between(sp['w'], 0, np.nan_to_num(y, nan=0.0),
+                        where=near, color=col, alpha=0.28, lw=0, zorder=5)
+        if label:
+            #label at the peak nearest a selected line, staggered over three
+            #rows so tightly spaced neighbours stay readable
+            ax.text(nearestPeak(sp), height*(1.04 + 0.30*(k % 3)), sp['lbl'],
+                    color=col, fontsize=6.5, ha='center', va='bottom', zorder=7)
+    return drawn
+
+def Plot_Zeeman_Estimates(ax, estCen, estLow, estHigh, estLbl, selWvl,
+                          window = 3.0, height = 3.0, cmap = 'hsv',
+                          nCycle = 9, cStart = 0, label = True):
+    """
+    Draw the ESTIMATED Zeeman envelopes near a stack's selected lines.
+
+    These are the candidate lines Curt has not computed - no h5 file, so no
+    measured profile to plot. Without them a panel looks empty next to, say,
+    Ni I or Cu I, which reads as "nothing nearby" when the truth is "nothing
+    calculated". They are drawn as flat hatched boxes spanning the estimated
+    envelope rather than as spectra, precisely because the line SHAPE is not
+    known - only its width, from Est_Zeeman_Width.
+
+    Inputs:
+    - ax: matplotlib axis to draw on
+    - estCen, estLow, estHigh: nparray - estimated envelope centre and edges
+    - estLbl: sequence of str - display label per estimated entry
+    - selWvl: nparray - the wavelengths selected for this stack
+    - window: float - nm either side of a selected line to draw
+    - height: float - the height a full-scale measured spectrum would reach
+    - cmap, nCycle: cycling colour wheel, matched to Plot_Zeeman_Spectra
+    - cStart: int - colour index to start from, so estimates continue the
+      cycle rather than repeating the measured spectra's colours
+    - label: bool - annotate each box
+    Outputs:
+    - drawn: list of indices actually plotted
+    """
+    selWvl = np.atleast_1d(np.asarray(selWvl, dtype=float))
+    cm = plt.get_cmap(cmap)
+    estCen = np.asarray(estCen); estLow = np.asarray(estLow); estHigh = np.asarray(estHigh)
+
+    near = np.flatnonzero(np.min(np.abs(estCen[:,None] - selWvl[None,:]), axis=1) <= window)
+    near = near[np.argsort(estCen[near])]
+
+    for k, ii in enumerate(near):
+        r, g, b, _ = cm(((cStart + k) % nCycle)/nCycle)
+        col = (r*0.82, g*0.82, b*0.82)
+        w = estHigh[ii] - estLow[ii]
+        #flat box: the width is estimated, the profile is unknown
+        ax.add_patch(plt.Rectangle((estLow[ii], 0), max(w, 0.02), height*0.5,
+                                   facecolor=col, alpha=0.22, edgecolor=col,
+                                   ls='--', lw=1.0, hatch='///', zorder=4))
+        ax.plot([estCen[ii], estCen[ii]], [0, height*0.5], color=col,
+                lw=1.0, ls='--', zorder=5)
+        if label:
+            ax.text(estCen[ii], height*(0.54 + 0.30*(k % 3)), estLbl[ii],
+                    color=col, fontsize=6.5, ha='center', va='bottom',
+                    style='italic', zorder=7)
+    return list(near)
+
+def Plot_Stack(scores,stackL,wvl,atomicS,prevTok,wvlW = 1, uvSW = 1, prevTokW = 1,zW = 1,
+               zFilename = 'sparc_line_ids_widths_v0.xlsx',
+               zFolder = 'split_ext_field_50_terms_h5',
+               xlsxFile = 'sparc_line_ids_widths_v0.xlsx', window = 3.0,
+               specH = 3.0, cmap = 'hsv', nTop = None, showEst = True,
+               printSel = True):
+    """
+    Plot the scores for each stack, best first.
+
+    Each panel shows the stack's selected lines (Plot_Lines) over the actual
+    Zeeman spectra of whatever lies within `window` nm of them, one colour per
+    neighbouring term set. This replaces the single black summed-overlap trace
+    that used to run along the bottom: that curve spanned the whole survey and
+    could not show WHICH line was crowding a selection.
+
     Inputs:
     - scores: nparray- the scores for each stack
     - stackL: list of lists- the stacks to plot
     - wvl: nparray- the wavelengths for each stack
     - atomicS: nparray- the atomic states for each stack
     - prevTok: nparray- the previous tokamak usage for each stack
+    - zFolder: str - folder of h5 term files supplying the spectra
+    - xlsxFile: str - candidate line list, used to build the estimated
+      envelopes for lines with no h5 file
+    - window: float - nm either side of a selected line to draw spectra for
+    - specH: float - plot height of a fully normalised spectrum
+    - cmap: str - cycling colour wheel used to separate neighbouring spectra
+    - nTop: int or None - only plot this many best stacks (None = all, which
+      for a 98M combination run is effectively endless)
+    - showEst: bool - also draw estimated envelopes for lines outside the h5
+      set, so an empty neighbourhood is not mistaken for a clean one
+    - printSel: bool - print the wavelength chosen for each species in each
+      stack, sorted blue to red (the order a dichroic chain would split them)
     """
-    #wvlOvl,ovrlp = Prep_Zeeman(zFilename, wvlD = 0.5, plot = True)
-    wvlOvl,ovrlp = Load_H5_Zeeman(folder='broad_all_fixed',wvlD = 0.01,plot = True)
+    #individual spectra, kept separate so each can carry its own colour
+    spectra = Load_H5_Spectra(zFolder)
+
+    #Exact candidate wavelengths. The combination array is float16, whose
+    #resolution is 0.25-0.5 nm here, so printing straight from it would report
+    #e.g. He 471.25 for a line that is really at 471.315. Matching each
+    #selection back to the candidate list recovers the true value.
+    lWvl = lSpec = lIon = lPrev = None
+    if printSel:
+        try:
+            lWvl, lSpec, lIon, lPrev = Load_data(xlsxFile)
+        except Exception as e:
+            print(f'Plot_Stack: could not read {xlsxFile} for exact '
+                  f'wavelengths ({type(e).__name__}); printing float16 values')
+
+    def Exact_Line(w16, sp):
+        """Recover the true wavelength/ion/prev-tok behind a float16 selection."""
+        if lWvl is None:
+            return float(w16), '', False
+        m = (lSpec == sp)
+        if not m.any():
+            return float(w16), '', False
+        k = int(np.argmin(np.abs(lWvl[m] - float(w16))))
+        return float(lWvl[m][k]), str(lIon[m][k]), bool(lPrev[m][k])
+
+    #estimated envelopes for the candidate lines with no h5 spectrum
+    estCen = estLow = estHigh = np.array([])
+    estLbl = []
+    if showEst:
+        Merge_Zeeman_Catalog(zFolder, xlsxFile, verbose=False)
+        cat = pd.read_csv(os.path.join(zFolder, 'zeeman_catalog.csv'))
+        est = cat[cat['estimated']]
+        estCen = est['center'].to_numpy()
+        estLow = est['low'].to_numpy()
+        estHigh = est['high'].to_numpy()
+        #'Ni_1_471.442_EST_analytic-Lande' -> 'Ni 1 471.4 est'
+        for f_ in est['file']:
+            p = str(f_).split('_')
+            try:
+                estLbl.append(f'{p[0]} {p[1]} {float(p[2]):.1f} est')
+            except (IndexError, ValueError):
+                estLbl.append(str(f_))
+        print(f'Plot_Stack: {len(spectra)} measured spectra + '
+              f'{len(estCen)} estimated envelopes available')
+
     scores[:,0] *= wvlW
     scores[:,1] *= prevTokW
     scores[:,2] *= uvSW
@@ -739,6 +1496,8 @@ def Plot_Stack(scores,stackL,wvl,atomicS,prevTok,wvlW = 1, uvSW = 1, prevTokW = 
 
     #sort the list and order from highest to lowest
     sorted_indices = np.argsort(weightS)[::-1]
+    if nTop is not None:
+        sorted_indices = sorted_indices[:nTop]
 
     cspec = np.array([s.split(' ')[0] for s in atomicS[:,0]])
 
@@ -746,20 +1505,42 @@ def Plot_Stack(scores,stackL,wvl,atomicS,prevTok,wvlW = 1, uvSW = 1, prevTokW = 
     idx = [np.searchsorted(cspec, substack) for substack in stackL]
 
 
-    for i in sorted_indices:
+    for rank, i in enumerate(sorted_indices, 1):
         f,a = plt.subplots(len(stackL),1,sharex = True)
 
         subWvl = wvl[:,i]
         subSpec = atomicS[:,i]
+
+        if printSel:
+            print(f'\n=== rank {rank}  (combination {i})  total {weightS[i]:.2f}'
+                  f'  |  wvl {scores[i,0]:.2f}  uv {scores[i,2]:.2f}'
+                  f'  prevTok {scores[i,1]:.2f}  Z {scores[i,3]:.2f} ===')
 
         for j in range(len(stackL)):
             cwvl = np.take(subWvl,idx[j])
 
             cas = np.take(subSpec,idx[j])
 
+            if printSel:
+                #blue to red: the order a dichroic chain would split them
+                sel = [Exact_Line(w, s.split(' ')[0]) + (s,)
+                       for w, s in zip(cwvl, cas)]
+                sel.sort(key=lambda t: t[0])
+                print(f'  stack {j+1}: {", ".join(stackL[j])}')
+                for exW, exIon, exPrev, s in sel:
+                    tag = ' (prev tok)' if exPrev else ''
+                    print(f'     {s.split(" ")[0]:<3s} {exIon:<3s} '
+                          f'{exW:9.3f} nm{tag}')
 
             Plot_Lines(cwvl,cas,None,a[j])
-            a[j].plot(wvlOvl, ovrlp, color='black', linewidth=1)
+            drawn = Plot_Zeeman_Spectra(a[j], spectra, cwvl, window = window,
+                                        height = specH, cmap = cmap)
+            if showEst and len(estCen):
+                #continue the colour cycle so estimates do not reuse the
+                #colours already spent on the measured spectra
+                Plot_Zeeman_Estimates(a[j], estCen, estLow, estHigh, estLbl,
+                                      cwvl, window = window, height = specH,
+                                      cmap = cmap, cStart = len(drawn))
 
         #set the title with the total score and weighting
         total_score = weightS[i]
@@ -833,9 +1614,12 @@ if __name__ == '__main__':
     filename = 'lines.xlsx'
     filename = 'sparc_line_ids_v1.xlsx'
     filename = 'sparc_line_ids_widths_v0.xlsx'
+    filename = 'sparc_line_ids_widths_v1_balmer.xlsx'
     zFolder = 'broad_all_fixed'
     zFolder = 'split_ext_field_50_terms_h5'
-    zFile = 'broad_all_fixed/wavelengths.csv'
+
+
+    zFile = zFolder + '/wavelengths.csv'
     saveF = 'TestStack_broadfixed.npz'  #new name so results from the old buggy broad/ data are kept
     
     stackL =[ ['B','He','O'],['N','C','B','W']]
@@ -853,16 +1637,22 @@ if __name__ == '__main__':
             ['He', 'Ni', 'Mo', 'Al', 'C', 'N' ],]
     #regenerate wavelengths.csv (low/high/center of each Zeeman-split peak)
     #from the fixed term-grouped h5 dataset
+    
     Load_H5_Zeeman(folder=zFolder,wvlD = 0.01,plot = False)
 
-    wvl, spec, ion, prevTok= Load_data(filename)
+
+    wvl, spec, ion, prevTok = Load_data(filename)
     outWvl, outAS, outPT = Filter_Stacks(stackL,wvl, spec, ion, prevTok)
 
-    scores = Grade_Stack(stackL, outWvl, outAS, outPT,zFile)
+    #zFolder+filename -> Zeeman catalog = measured h5 envelopes + estimated
+    #envelopes for the lines Curt has not computed yet
+    scores = Grade_Stack(stackL, outWvl, outAS, outPT,zFile,
+                         zFolder = zFolder, xlsxFile = filename)
     Save_GradedStack(saveF, outWvl,outAS,outPT,scores)
+    
+    
+    outWvl, outAS, outPT, scores = Load_GradedStack(saveF)
 
-    #outWvl, outAS, outPT, scores = Load_GradedStack(saveF)
-
-    #Plot_Stack(scores, stackL, outWvl, outAS, outPT,prevTokW = 0.5,uvSW = 2,zW = 1,zFilename = zFile)
+    Plot_Stack(scores, stackL, outWvl, outAS, outPT,prevTokW = 0.5,uvSW = 2,zW = 1,zFilename = zFile)
 
     #Plot_lines(wvl, spec, ion)
