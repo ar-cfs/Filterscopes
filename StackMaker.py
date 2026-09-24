@@ -731,7 +731,7 @@ def Pattern(arr,repeats,tiles):
 
 
 
-def Filter_Stacks(stackL,wvl,spec,ion,prevTok):
+def Filter_Stacks(stackL,wvl,spec,ion,prevTok, force = None, tol = 0.05):
     """
     Creates a list of all the possible lines (wavelengths) for each element
     specified in the stack.
@@ -742,6 +742,13 @@ def Filter_Stacks(stackL,wvl,spec,ion,prevTok):
     - spec: nparray-(n) the species of the possible lines to observe
     - ion: nparray- (n)the ionization state of the possible lines to observe
     - prevTok: nparray (n)- boolean array indicating if the line was used in a tokamak
+    - force: dict or None - pin a species to one or more specific lines, e.g.
+      {'He': 471.315} or {'He': [471.315, 587.562]}. This is applied BEFORE the
+      combinations are generated, so it divides the total rather than filtering
+      afterwards: pinning He drops its 10 candidates to 1 and the whole product
+      shrinks 10x. Use this, not Grade_Stack's force, whenever you can - it is
+      the difference between a search that fits in memory and one that does not.
+    - tol: float - nm tolerance when matching a forced wavelength to the list
     Outputs:
     - outWvl: nparray- the wavelengths of the lines for each possible stack, shape (unique species, tot wavelength combinations)
     where x is the number of species and tot is the total number of combinations of lines
@@ -756,14 +763,41 @@ def Filter_Stacks(stackL,wvl,spec,ion,prevTok):
     uspec = np.array(uspec)
     uspec = np.unique(uspec)
 
-    num =np.zeros(uspec.shape[0], dtype=int)
-    #calculate the number of lines for each species
-    for i, s in enumerate(uspec):
-        num[i] = np.sum(s==spec)
-    
+    #a forced species that is not in any stack would otherwise be ignored in
+    #silence, so a typo would quietly grade the unconstrained search
+    if force:
+        stray = [s for s in force if s not in set(uspec)]
+        if stray:
+            raise ValueError(f"force names {stray} which are not in stackL "
+                             f"(stack species: {', '.join(uspec)})")
+
+    #candidate line indices per species, after any forcing
+    keep = []
+    for s in uspec:
+        idxS = np.flatnonzero(spec == s)
+        if len(idxS) == 0:
+            raise ValueError(f"species {s!r} appears in stackL but has no lines "
+                             f"in the line list; available: "
+                             f"{', '.join(sorted(set(spec)))}")
+        if force and s in force:
+            want = np.atleast_1d(np.asarray(force[s], dtype=float))
+            sel = []
+            for w in want:
+                j = int(np.argmin(np.abs(wvl[idxS] - w)))
+                if abs(wvl[idxS][j] - w) > tol:
+                    raise ValueError(f"forced line {w:.3f} nm for {s} is not in "
+                                     f"the list (nearest {wvl[idxS][j]:.3f} nm, "
+                                     f"tol {tol} nm)")
+                sel.append(idxS[j])
+            idxS = np.array(sorted(set(sel)))
+            print(f'  forcing {s} to {", ".join(f"{wvl[k]:.3f}" for k in idxS)} nm')
+        keep.append(idxS)
+
+    num = np.array([len(k) for k in keep], dtype=int)
+
     #multiply the number of lines for each species
 
-    tot = np.prod(num)
+    tot = int(np.prod(num.astype(object)))
 
     outWvl = np.zeros((uspec.shape[0],tot),dtype = np.float16)
     outAS = np.zeros((uspec.shape[0],tot), dtype='<U3')
@@ -786,10 +820,11 @@ def Filter_Stacks(stackL,wvl,spec,ion,prevTok):
         if tileI == 0:
             tiles = 0
         
-        mask = spec == s
-        wvlS = wvl[mask]
-        ionS = s+' '+ion[mask]
-        prevTokS = prevTok[mask]
+        #keep[i] already has any forced restriction applied
+        kk = keep[i]
+        wvlS = wvl[kk]
+        ionS = s+' '+ion[kk]
+        prevTokS = prevTok[kk]
 
 
 
@@ -1128,7 +1163,8 @@ def Grade_UV(wvl,cutoff = 450,lwvl = 350):
     return out  
 
 def Grade_Stack(stackL, wvl, atomicS, prevTok,filename,lowMem = True,
-                zFolder = None, xlsxFile = None, zMode = 'envelope', **mergeKw):
+                zFolder = None, xlsxFile = None, zMode = 'envelope',
+                force = None, **mergeKw):
     """
     Grade the stack based on the wavelength, atomic state and previous tokamak usage
     Returns a score for each line in the stack
@@ -1148,6 +1184,12 @@ def Grade_Stack(stackL, wvl, atomicS, prevTok,filename,lowMem = True,
     - zMode: 'envelope' (default, conservative: Zeeman envelopes intersect) or
       'center' (line centre buried under another envelope). Switch to 'center'
       if the conservative test leaves too few clean stacks to choose between.
+    - force: dict or None - pin a species to one or more lines, e.g.
+      {'He': 471.315}. Combinations that do not use a pinned line get -inf so
+      they sort last, leaving the ranking to the allowed ones. This filters
+      AFTER the combinations exist, so it costs no less memory - prefer
+      Filter_Stacks(force=...), which shrinks the product instead. Use this
+      only to re-slice an already generated (or loaded) set.
     - mergeKw: passed to Merge_Zeeman_Catalog (tol, bField, safety, cMax, ...)
     Outputs:
     - out: nparray - (wavelength combinations, 3) - the scores for each stack, where the first column is the wavelength score,
@@ -1221,6 +1263,24 @@ def Grade_Stack(stackL, wvl, atomicS, prevTok,filename,lowMem = True,
         print('Zeeman done')
 
         print(f'Stack {i+1} graded in {time()-t:.2f} seconds')
+
+    #post-hoc pinning: sink every combination that does not use a forced line
+    if force:
+        ok = np.ones(wvl.shape[-1], dtype=bool)
+        for s, w in force.items():
+            rows = np.flatnonzero(cspec == s)
+            if len(rows) == 0:
+                raise ValueError(f"forced species {s!r} is not in this stack set")
+            #the combination array is float16, so compare against the float16
+            #image of the requested wavelengths
+            want = np.unique(np.atleast_1d(np.asarray(w)).astype(np.float16))
+            ok &= np.isin(wvl[rows[0]], want)
+        print(f'force: {int(ok.sum()):,} of {len(ok):,} combinations keep the '
+              f'pinned lines; the rest are set to -inf')
+        if not ok.any():
+            raise ValueError('force removed every combination - check the '
+                             'wavelengths match the candidate list exactly')
+        out1[~ok] = -np.inf
 
         #cScore = (wvlScore + ptScore + uvScore + zScore)  #negative score for minimization
         """
@@ -1506,7 +1566,11 @@ def Plot_Stack(scores,stackL,wvl,atomicS,prevTok,wvlW = 1, uvSW = 1, prevTokW = 
 
 
     for rank, i in enumerate(sorted_indices, 1):
-        f,a = plt.subplots(len(stackL),1,sharex = True)
+        #squeeze=False keeps this a 2-D array even for a single stack, so the
+        #a[j] / a[0] / iteration below work; plt.subplots(1,1) would otherwise
+        #hand back a bare Axes that is not subscriptable
+        f,a = plt.subplots(len(stackL),1,sharex = False,squeeze = False)
+        a = a[:,0]
 
         subWvl = wvl[:,i]
         subSpec = atomicS[:,i]
@@ -1617,10 +1681,11 @@ if __name__ == '__main__':
     filename = 'sparc_line_ids_widths_v1_balmer.xlsx'
     zFolder = 'broad_all_fixed'
     zFolder = 'split_ext_field_50_terms_h5'
+    zFolder = 'broad_split_ext_field_all_calculable'
 
 
     zFile = zFolder + '/wavelengths.csv'
-    saveF = 'TestStack_broadfixed.npz'  #new name so results from the old buggy broad/ data are kept
+    #new name again so the previous run (50-term h5 + v0 line list) is kept
     
     stackL =[ ['B','He','O'],['N','C','B','W']]
     stackL = [['O', 'N', 'C', 'B', 'He'],\
@@ -1632,9 +1697,16 @@ if __name__ == '__main__':
               ['W', 'Mo', 'Fe', 'Ni', 'Cu', 'Al','C'],\
               ['He', 'Ni', 'Mo', 'Al', 'C', 'N' ],]
     
+    saveF = 'TestStack_v1_Fix_Fe685_Al360_Mo386_Kr469_Ar696_W498_Ni547_Cu521.npz'
     stackL = [['O', 'N', 'C', 'B', 'He'],\
-            ['W', 'Mo', 'Fe', 'Ni', 'Cu', 'Al'],\
-            ['He', 'Ni', 'Mo', 'Al', 'C', 'N' ],]
+            ['W', 'Mo', 'Fe', 'Ni', 'Cu', 'Al','B'],\
+            ['He', 'Ni', 'Mo', 'Al', 'Fe' ,'W'],\
+            ['He', 'Ne','Ar', 'Kr']]
+
+    
+    #saveF = 'NobleStack.npz'
+    #stackL = [['He', 'Ne','Ar', 'Kr']]
+    
     #regenerate wavelengths.csv (low/high/center of each Zeeman-split peak)
     #from the fixed term-grouped h5 dataset
     
@@ -1642,7 +1714,7 @@ if __name__ == '__main__':
 
 
     wvl, spec, ion, prevTok = Load_data(filename)
-    outWvl, outAS, outPT = Filter_Stacks(stackL,wvl, spec, ion, prevTok)
+    outWvl, outAS, outPT = Filter_Stacks(stackL,wvl, spec, ion, prevTok, force = { 'Fe': 685.482, 'Al': 360.193, 'Mo': 386.410, 'Kr': 469.365, 'Ar': 696.543, 'W': 498.259, 'Ni': 547.691, 'Cu': 521.820})
 
     #zFolder+filename -> Zeeman catalog = measured h5 envelopes + estimated
     #envelopes for the lines Curt has not computed yet
