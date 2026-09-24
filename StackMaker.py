@@ -11,6 +11,13 @@ import re
 from fractions import Fraction
 from scipy.signal import find_peaks
 
+#Current default datasets. Plot_Stack and SpeciesLines both default to these,
+#so moving to a new h5 folder or line list is a one-line change here instead
+#of hunting down stale per-function defaults (which is how SpeciesLines ended
+#up plotting the old 50-term folder after __main__ had moved on).
+DEFAULT_XLSX = 'sparc_line_ids_widths_v1_balmer.xlsx'
+DEFAULT_ZFOLDER = 'broad_split_ext_field_all_calculable'
+
 
 colormap = [[6, 1, 31],[12, 0, 40],[14, 0, 51], [16, 1, 60],
  [17, 1, 76], [23, 0, 90], [26, 1, 105], [28, 0, 119], [28, 0, 136], 
@@ -669,19 +676,23 @@ def Load_data(filename):
 
         
 
-        gI = np.full_like(cwvl,False)
-        for i,lamb in enumerate(cwvl):
-            #if statement so that we don't drop the first line within 1 nm of the group
-            if gI[i]:
-                continue
-
-            diff = cwvl[i+1:]-lamb
-            mask = diff<1
-            
-            gI[i+1:] = mask
-
-        #now remove the lines which are within 1 nm of each other
-        gI = ~gI.astype(bool)
+        #Greedy selection with a priority order: previously-fielded lines
+        #first, then everything else, each tier blue to red. A line is kept
+        #only if it is >= 1 nm from every line already kept for this element.
+        #The old loop always kept the bluest line of a <1 nm group, which
+        #dropped fielded lines in favour of unfielded neighbours (N 348.299,
+        #N 348.496 and N 410.343 lost to 347.871/409.733; O 441.697 to 441.490).
+        #With no fielded line in a group this reproduces the old choice exactly.
+        #The >= 1 nm spacing per ELEMENT is kept (not per ion) on purpose:
+        #Filter_Stacks and Zeeman_Line_LUT index lines by element via float16,
+        #whose 0.25-0.5 nm spacing needs same-element lines well separated.
+        order = np.lexsort((cwvl, ~cprevTok.astype(bool)))
+        keepI = []
+        for i in order:
+            if all(abs(cwvl[i] - cwvl[k]) >= 1 for k in keepI):
+                keepI.append(i)
+        gI = np.zeros(cwvl.shape[0], dtype=bool)
+        gI[keepI] = True
 
         for i in range(len(gI)):
             if gI[i]:
@@ -1151,9 +1162,11 @@ def Grade_UV(wvl,cutoff = 450,lwvl = 350):
     Outputs:
     - out: nparray - (wavelength combinations) - the score for each stack, where 1 is perfect and 0 is bad
     """
-    #line from 0 to 1 from lwvl to cutoff
-    cwvl = np.clip(wvl, lwvl, None)  #clip the wavelengths to be above lwvl
-    cwvl = np.clip(wvl, None, cutoff)  #clip the wavelengths to be below cutoff
+    #line from 0 to 1 from lwvl to cutoff. Both bounds in ONE clip: the old
+    #code clipped the lower bound, then re-clipped the ORIGINAL array for the
+    #upper bound, discarding the first clip - so lines below lwvl (N III
+    #336.7, N IV 347.9, ...) scored negative instead of 0.
+    cwvl = np.clip(wvl, lwvl, cutoff)
     cwvl = (cwvl - lwvl) / (cutoff - lwvl)  #normalize the wavelengths to be between 0 and 1
 
     #now sum the scores and normalize by the number of lines
@@ -1471,8 +1484,8 @@ def Plot_Zeeman_Estimates(ax, estCen, estLow, estHigh, estLbl, selWvl,
 
 def Plot_Stack(scores,stackL,wvl,atomicS,prevTok,wvlW = 1, uvSW = 1, prevTokW = 1,zW = 1,
                zFilename = 'sparc_line_ids_widths_v0.xlsx',
-               zFolder = 'split_ext_field_50_terms_h5',
-               xlsxFile = 'sparc_line_ids_widths_v0.xlsx', window = 3.0,
+               zFolder = DEFAULT_ZFOLDER,
+               xlsxFile = DEFAULT_XLSX, window = 3.0,
                specH = 3.0, cmap = 'hsv', nTop = None, showEst = True,
                printSel = True):
     """
@@ -1548,11 +1561,19 @@ def Plot_Stack(scores,stackL,wvl,atomicS,prevTok,wvlW = 1, uvSW = 1, prevTokW = 
         print(f'Plot_Stack: {len(spectra)} measured spectra + '
               f'{len(estCen)} estimated envelopes available')
 
-    scores[:,0] *= wvlW
-    scores[:,1] *= prevTokW
-    scores[:,2] *= uvSW
-    scores[:,3] *= zW
-    weightS = np.sum(scores, axis=1)
+    #Weight WITHOUT touching the caller's array. This used to do
+    #scores[:,k] *= w in place, so a second Plot_Stack call in the same session
+    #compounded the weights. Summed column by column in float32 so no full
+    #weighted copy of a ~98M x 4 array is made.
+    wts = np.array([wvlW, prevTokW, uvSW, zW], dtype=np.float32)
+    weightS = np.zeros(scores.shape[0], dtype=np.float32)
+    with np.errstate(invalid='ignore'):   #-inf*0 below is expected, handled next
+        for k in range(4):
+            weightS += wts[k]*scores[:,k].astype(np.float32)
+    #rows sunk by Grade_Stack(force=...) are -inf; a zero weight turns
+    #-inf*0 into NaN, which argsort puts LAST, i.e. first after the [::-1]
+    weightS[np.isnan(weightS)] = -np.inf
+    wS = lambda i, k: float(wts[k]*scores[i,k])   #weighted component, for display
 
     #sort the list and order from highest to lowest
     sorted_indices = np.argsort(weightS)[::-1]
@@ -1577,8 +1598,8 @@ def Plot_Stack(scores,stackL,wvl,atomicS,prevTok,wvlW = 1, uvSW = 1, prevTokW = 
 
         if printSel:
             print(f'\n=== rank {rank}  (combination {i})  total {weightS[i]:.2f}'
-                  f'  |  wvl {scores[i,0]:.2f}  uv {scores[i,2]:.2f}'
-                  f'  prevTok {scores[i,1]:.2f}  Z {scores[i,3]:.2f} ===')
+                  f'  |  wvl {wS(i,0):.2f}  uv {wS(i,2):.2f}'
+                  f'  prevTok {wS(i,1):.2f}  Z {wS(i,3):.2f} ===')
 
         for j in range(len(stackL)):
             cwvl = np.take(subWvl,idx[j])
@@ -1608,10 +1629,10 @@ def Plot_Stack(scores,stackL,wvl,atomicS,prevTok,wvlW = 1, uvSW = 1, prevTokW = 
 
         #set the title with the total score and weighting
         total_score = weightS[i]
-        wvl_score = scores[i,0]
-        prevTok_score = scores[i,1]
-        uv_score = scores[i,2]
-        z_score = scores[i,3]
+        wvl_score = wS(i,0)
+        prevTok_score = wS(i,1)
+        uv_score = wS(i,2)
+        z_score = wS(i,3)
 
         a[0].set_title(f' Total Score: {total_score:.2f}, Wvl Score: {wvl_score:.2f}, UV Score: {uv_score:.2f}, Prev Tok Score: {prevTok_score:.2f}, Z Score: {z_score:.2f}')
 

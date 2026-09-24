@@ -29,11 +29,13 @@ from matplotlib.gridspec import GridSpec
 
 from StackMaker import (Load_data, Load_H5_Spectra, Plot_Zeeman_Spectra,
                         Plot_Zeeman_Estimates, Merge_Zeeman_Catalog,
-                        Zeeman_Line_Scores, wave_to_rgb)
+                        Zeeman_Line_Scores, wave_to_rgb,
+                        DEFAULT_XLSX, DEFAULT_ZFOLDER)
 
-XLSX = 'sparc_line_ids_widths_v0.xlsx'
-XLSX = 'sparc_line_ids_widths_v1_balmer.xlsx'
-ZFOLDER = 'split_ext_field_50_terms_h5'
+#taken from StackMaker so the two scripts can never drift apart again (this
+#was left pointing at the old 50-term folder after StackMaker moved on)
+XLSX = DEFAULT_XLSX
+ZFOLDER = DEFAULT_ZFOLDER
 
 
 def Cluster_Lines(wvl, gap):
