@@ -450,7 +450,7 @@ def Est_Zeeman_Width(wvl, termLow, jLow, termUpp, jUpp, bField = 12.5,
     return width, method
 
 def Merge_Zeeman_Catalog(folder, xlsxFile, tol = 0.1, saveCSV = True,
-                         verbose = True, **estKw):
+                         verbose = True, returnLabels = False, **estKw):
     """
     Build the full Zeeman overlap catalog that Grade_Zeeman works from, by
     combining:
@@ -475,11 +475,14 @@ def Merge_Zeeman_Catalog(folder, xlsxFile, tol = 0.1, saveCSV = True,
     - tol: float - nm tolerance for matching a spreadsheet line to a NIST line
     - saveCSV: bool - write zeeman_catalog.csv into folder for inspection
     - verbose: bool - print a coverage summary
+    - returnLabels: bool - also return the per-entry source label (h5 term
+      file stem, or '<el>_<ch>_<wvl>_EST_<method>'), without writing the CSV
     - estKw: passed through to Est_Zeeman_Width (bField, safety, cMax, ...)
     Outputs:
     - center, low, high: nparray - envelope centre and edges (nm) for every
       entry, ready for Process_Zeeman
     - isEst: nparray of bool - True where the entry is an estimate
+    - labels: list of str - only if returnLabels
     """
 
     #---- 1. measured envelopes from the h5 term files --------------------
@@ -552,6 +555,8 @@ def Merge_Zeeman_Catalog(folder, xlsxFile, tol = 0.1, saveCSV = True,
                       'estimated': isEst}).to_csv(
             os.path.join(folder, 'zeeman_catalog.csv'), index=False)
 
+    if returnLabels:
+        return center, low, high, isEst, list(meas['file']) + eLbl
     return center, low, high, isEst
 
 def Load_xlsx(filename, prevTokCol = 'Prev_Tok'):
@@ -849,7 +854,7 @@ def Filter_Stacks(stackL,wvl,spec,ion,prevTok, force = None, tol = 0.05):
 
     return outWvl, outAS, outPT
 
-def Line_Envelopes(lineWvl, cen, low, high, tol = 0.5):
+def Line_Envelopes(lineWvl, cen, low, high, tol = 0.5, returnIdx = False):
     """
     Find each candidate line's OWN Zeeman envelope in the catalog.
 
@@ -861,14 +866,18 @@ def Line_Envelopes(lineWvl, cen, low, high, tol = 0.5):
     - lineWvl: nparray (n) - candidate line wavelengths in nm
     - cen, low, high: nparray (m) - catalog envelope centres and edges
     - tol: float - max nm from a catalog centre to still call it the same line
+    - returnIdx: bool - also return which catalog entry was taken as the
+      line's own (-1 if none), so callers can exclude it from "neighbours"
     Outputs:
     - lineLow, lineHigh: nparray (n) - the line's own envelope, NaN if none
+    - own: nparray (n) int - only if returnIdx
     """
     lineWvl = np.asarray(lineWvl, dtype=float)
     cen, low, high = np.asarray(cen), np.asarray(low), np.asarray(high)
 
     lineLow = np.full(lineWvl.shape[0], np.nan)
     lineHigh = np.full(lineWvl.shape[0], np.nan)
+    own = np.full(lineWvl.shape[0], -1, dtype=int)
     for i, w in enumerate(lineWvl):
         inside = (low <= w) & (high >= w)
         if inside.any():
@@ -878,6 +887,9 @@ def Line_Envelopes(lineWvl, cen, low, high, tol = 0.5):
             if abs(cen[j] - w) > tol:
                 continue                    #no data for this line
         lineLow[i], lineHigh[i] = low[j], high[j]
+        own[i] = j
+    if returnIdx:
+        return lineLow, lineHigh, own
     return lineLow, lineHigh
 
 def Zeeman_Line_Scores(lineWvl, cen, low, high, mode = 'envelope', tol = 0.5):
@@ -1487,7 +1499,7 @@ def Plot_Stack(scores,stackL,wvl,atomicS,prevTok,wvlW = 1, uvSW = 1, prevTokW = 
                zFolder = DEFAULT_ZFOLDER,
                xlsxFile = DEFAULT_XLSX, window = 3.0,
                specH = 3.0, cmap = 'hsv', nTop = None, showEst = True,
-               printSel = True):
+               printSel = True, selFile = None, plot = True):
     """
     Plot the scores for each stack, best first.
 
@@ -1515,36 +1527,61 @@ def Plot_Stack(scores,stackL,wvl,atomicS,prevTok,wvlW = 1, uvSW = 1, prevTokW = 
       set, so an empty neighbourhood is not mistaken for a clean one
     - printSel: bool - print the wavelength chosen for each species in each
       stack, sorted blue to red (the order a dichroic chain would split them)
+    - selFile: str or None - write the exact selected lines of every plotted
+      rank to this CSV (one row per line: rank, stack, species, ion,
+      wavelength, prev tok, scores, and the xlsx/zFolder used). This is the
+      input to FilterSpec.py. Written BEFORE any figure opens, so it exists
+      even if you close the plotting session early.
+    - plot: bool - False skips the figures (and loading the spectra), e.g. to
+      just write selFile
     """
     #individual spectra, kept separate so each can carry its own colour
-    spectra = Load_H5_Spectra(zFolder)
+    spectra = Load_H5_Spectra(zFolder) if plot else []
 
     #Exact candidate wavelengths. The combination array is float16, whose
     #resolution is 0.25-0.5 nm here, so printing straight from it would report
     #e.g. He 471.25 for a line that is really at 471.315. Matching each
     #selection back to the candidate list recovers the true value.
     lWvl = lSpec = lIon = lPrev = None
-    if printSel:
+    fWvl = fSpec = fIon = fPrev = None
+    if printSel or selFile:
         try:
             lWvl, lSpec, lIon, lPrev = Load_data(xlsxFile)
+            fWvl, fSpec, _, fIon, fPrev, _, _ = Load_xlsx(xlsxFile)
         except Exception as e:
             print(f'Plot_Stack: could not read {xlsxFile} for exact '
-                  f'wavelengths ({type(e).__name__}); printing float16 values')
+                  f'wavelengths ({type(e).__name__}); using float16 values')
 
     def Exact_Line(w16, sp):
-        """Recover the true wavelength/ion/prev-tok behind a float16 selection."""
+        """
+        Recover the true wavelength/ion/prev-tok behind a float16 selection.
+        float16 rounds to the nearest representable value, so the true line is
+        within half a float16 step of w16. Only accept a match inside that: the
+        old nearest-anything lookup would silently report a DIFFERENT line if
+        the line list had changed since grading (e.g. the 2026-09-24 downselect
+        change swaps N 347.871 for 348.299, only 0.55 nm away). The downselected
+        list is tried first, then the full spreadsheet, so stacks graded with an
+        older downselect still resolve to the line that was really graded.
+        Returns (wavelength, ion, prevTok, note).
+        """
         if lWvl is None:
-            return float(w16), '', False
-        m = (lSpec == sp)
-        if not m.any():
-            return float(w16), '', False
-        k = int(np.argmin(np.abs(lWvl[m] - float(w16))))
-        return float(lWvl[m][k]), str(lIon[m][k]), bool(lPrev[m][k])
+            return float(w16), '', False, 'float16 value (no line list)'
+        tol = 0.5*float(np.spacing(np.float16(w16))) + 1e-3
+        for W, S, I, Pt, note in ((lWvl, lSpec, lIon, lPrev, ''),
+                                  (fWvl, fSpec, fIon, fPrev,
+                                   'not in current downselect')):
+            m = np.flatnonzero(S == sp)
+            if len(m) == 0:
+                continue
+            k = m[int(np.argmin(np.abs(W[m] - float(w16))))]
+            if abs(W[k] - float(w16)) <= tol:
+                return float(W[k]), str(I[k]), bool(Pt[k]), note
+        return float(w16), '', False, 'NO MATCH in line list (float16 value)'
 
     #estimated envelopes for the candidate lines with no h5 spectrum
     estCen = estLow = estHigh = np.array([])
     estLbl = []
-    if showEst:
+    if showEst and plot:
         Merge_Zeeman_Catalog(zFolder, xlsxFile, verbose=False)
         cat = pd.read_csv(os.path.join(zFolder, 'zeeman_catalog.csv'))
         est = cat[cat['estimated']]
@@ -1579,12 +1616,59 @@ def Plot_Stack(scores,stackL,wvl,atomicS,prevTok,wvlW = 1, uvSW = 1, prevTokW = 
     sorted_indices = np.argsort(weightS)[::-1]
     if nTop is not None:
         sorted_indices = sorted_indices[:nTop]
+    elif len(sorted_indices) > 100 and (selFile or printSel):
+        print(f'Plot_Stack: nTop not set - limiting to the best 100 of '
+              f'{len(sorted_indices):,} combinations')
+        sorted_indices = sorted_indices[:100]
 
     cspec = np.array([s.split(' ')[0] for s in atomicS[:,0]])
 
     #find the indexes of the speces in the stackL
     idx = [np.searchsorted(cspec, substack) for substack in stackL]
 
+
+    #---- exact selections: print, and save for FilterSpec.py ----------------
+    #done in its own pass before any figure opens, so selFile is on disk even
+    #if the interactive plotting below is closed part way through
+    selRows = []
+    if printSel or selFile:
+        for rank, i in enumerate(sorted_indices, 1):
+            if printSel:
+                print(f'\n=== rank {rank}  (combination {i})  total {weightS[i]:.2f}'
+                      f'  |  wvl {wS(i,0):.2f}  uv {wS(i,2):.2f}'
+                      f'  prevTok {wS(i,1):.2f}  Z {wS(i,3):.2f} ===')
+            for j in range(len(stackL)):
+                cwvl = np.take(wvl[:,i], idx[j])
+                cas = np.take(atomicS[:,i], idx[j])
+                #blue to red: the order a dichroic chain would split them
+                sel = [Exact_Line(w, s.split(' ')[0]) + (s,)
+                       for w, s in zip(cwvl, cas)]
+                sel.sort(key=lambda t: t[0])
+                if printSel:
+                    print(f'  stack {j+1}: {", ".join(stackL[j])}')
+                for exW, exIon, exPrev, note, s in sel:
+                    if printSel:
+                        tag = ' (prev tok)' if exPrev else ''
+                        tag += f'  [{note}]' if note else ''
+                        print(f'     {s.split(" ")[0]:<3s} {exIon:<3s} '
+                              f'{exW:9.3f} nm{tag}')
+                    selRows.append(dict(
+                        rank=rank, combination=int(i), stack=j+1,
+                        stack_species=' '.join(stackL[j]),
+                        species=s.split(' ')[0], ion=exIon,
+                        wavelength_nm=round(exW, 4), prev_tok=exPrev,
+                        total_score=round(float(weightS[i]), 4),
+                        wvl_score=round(wS(i,0), 4),
+                        prevtok_score=round(wS(i,1), 4),
+                        uv_score=round(wS(i,2), 4), z_score=round(wS(i,3), 4),
+                        weights=f'wvl={wvlW} prevTok={prevTokW} uv={uvSW} z={zW}',
+                        xlsx=xlsxFile, zfolder=zFolder, note=note))
+    if selFile:
+        pd.DataFrame(selRows).to_csv(selFile, index=False)
+        print(f'Plot_Stack: wrote {len(selRows)} selected lines from the best '
+              f'{len(sorted_indices)} combination(s) to {selFile}')
+    if not plot:
+        return pd.DataFrame(selRows)
 
     for rank, i in enumerate(sorted_indices, 1):
         #squeeze=False keeps this a 2-D array even for a single stack, so the
@@ -1596,26 +1680,10 @@ def Plot_Stack(scores,stackL,wvl,atomicS,prevTok,wvlW = 1, uvSW = 1, prevTokW = 
         subWvl = wvl[:,i]
         subSpec = atomicS[:,i]
 
-        if printSel:
-            print(f'\n=== rank {rank}  (combination {i})  total {weightS[i]:.2f}'
-                  f'  |  wvl {wS(i,0):.2f}  uv {wS(i,2):.2f}'
-                  f'  prevTok {wS(i,1):.2f}  Z {wS(i,3):.2f} ===')
-
         for j in range(len(stackL)):
             cwvl = np.take(subWvl,idx[j])
 
             cas = np.take(subSpec,idx[j])
-
-            if printSel:
-                #blue to red: the order a dichroic chain would split them
-                sel = [Exact_Line(w, s.split(' ')[0]) + (s,)
-                       for w, s in zip(cwvl, cas)]
-                sel.sort(key=lambda t: t[0])
-                print(f'  stack {j+1}: {", ".join(stackL[j])}')
-                for exW, exIon, exPrev, s in sel:
-                    tag = ' (prev tok)' if exPrev else ''
-                    print(f'     {s.split(" ")[0]:<3s} {exIon:<3s} '
-                          f'{exW:9.3f} nm{tag}')
 
             Plot_Lines(cwvl,cas,None,a[j])
             drawn = Plot_Zeeman_Spectra(a[j], spectra, cwvl, window = window,
@@ -1641,6 +1709,7 @@ def Plot_Stack(scores,stackL,wvl,atomicS,prevTok,wvlW = 1, uvSW = 1, prevTokW = 
 
             ax.set_yticklabels([])
         plt.show()
+    return pd.DataFrame(selRows)
 
 
 
@@ -1745,7 +1814,14 @@ if __name__ == '__main__':
     
     
     outWvl, outAS, outPT, scores = Load_GradedStack(saveF)
-
-    Plot_Stack(scores, stackL, outWvl, outAS, outPT,prevTokW = 0.5,uvSW = 2,zW = 1,zFilename = zFile)
+    
+    #zFolder/xlsxFile must be passed or Plot_Stack falls back to its defaults
+    #(the old 50-term folder and the v0 line list) and would draw the wrong
+    #spectra. nTop caps the figures - without it this loops over every one of
+    #the ~98.5M combinations.
+    Plot_Stack(scores, stackL, outWvl, outAS, outPT,prevTokW = 2,uvSW = 2,zW = 1,
+               zFilename = zFile, zFolder = zFolder, xlsxFile = filename, nTop = 5,
+               selFile = saveF.replace('.npz', '_selected.csv'))
+    #then: python FilterSpec.py <that csv>  for dichroic + band-pass specs
 
     #Plot_lines(wvl, spec, ion)
