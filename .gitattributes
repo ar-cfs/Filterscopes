@@ -1,0 +1,4 @@
+# Store text files with LF in the repo; Windows checkouts get CRLF.
+# Binary files (and the UTF-16 requirements.txt, which git sees as binary)
+# are left untouched.
+* text=auto

@@ -1,0 +1,7 @@
+# graded stacks (tens of GB each)
+*.npz
+__pycache__/
+# Office lock files
+~$*
+# project virtualenv
+filterscopes/
